@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "turboquant"
+name = "aither-kvcache"
 version = "0.1.0"
 description = "Near-optimal KV cache quantization for LLM inference (arXiv:2504.19874)"
 readme = "README.md"
