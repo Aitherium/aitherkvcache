@@ -3,20 +3,21 @@ TurboQuant: Near-optimal vector quantizer for KV cache compression.
 
 Algorithm (MSE-optimal):
   1. Compute ||x|| and normalize to unit sphere
-  2. Apply random orthogonal rotation Pi (data-oblivious)
+  2. Apply random orthogonal rotation Π (data-oblivious)
   3. Scalar-quantize each coordinate using precomputed Lloyd-Max codebook
   4. Pack indices into low-bit representation
   5. Store packed indices + scalar norm
 
-Dequantization reverses steps 4->3->2->1.
+Dequantization reverses steps 4→3→2→1.
 
-Achieves MSE within 2.7x of the information-theoretic lower bound
+Achieves MSE within 2.7× of the information-theoretic lower bound
 across all bit-widths, with zero calibration data and zero retraining.
 
 Reference: Zandieh et al., "TurboQuant: Online Vector Quantization with
 Near-optimal Distortion Rate", arXiv:2504.19874, April 2025.
 """
 
+import math
 import time
 import torch
 from dataclasses import dataclass
@@ -135,6 +136,7 @@ class TurboQuant:
 
         # Flatten to [N, D]
         x_flat = x.reshape(-1, self.head_dim).float()
+        N = x_flat.shape[0]
 
         # 1) Compute norms
         norms = x_flat.norm(dim=-1)
@@ -142,7 +144,7 @@ class TurboQuant:
         # 2) Normalize to unit sphere
         x_norm = x_flat / (norms.unsqueeze(-1) + 1e-10)
 
-        # 3) Random rotation: y = x_norm @ Pi^T
+        # 3) Random rotation: y = x_norm @ Π^T
         y = torch.matmul(x_norm, self.rotation.T)
 
         # 4-5) Quantize + pack
@@ -181,7 +183,7 @@ class TurboQuant:
         else:
             y_hat = self._pytorch_decode(packed_flat)
 
-        # Inverse rotation: x_hat = y_hat @ Pi
+        # Inverse rotation: x_hat = y_hat @ Π
         x_hat = torch.matmul(y_hat, self.rotation)
 
         # Rescale
@@ -241,7 +243,7 @@ class TurboQuant:
     def memory_report(self, seq_len: int, num_layers: int = 32,
                       num_kv_heads: int = 8) -> dict:
         """Compute memory usage for a KV cache configuration."""
-        # Total vectors = seq x layers x kv_heads x 2 (keys + values)
+        # Total vectors = seq × layers × kv_heads × 2 (keys + values)
         total_vectors = seq_len * num_layers * num_kv_heads * 2
 
         fp16_bytes = total_vectors * self.head_dim * 2
@@ -261,7 +263,7 @@ class TurboQuant:
     def validate(self, num_vectors: int = 10000,
                  device: Optional[str] = None) -> dict:
         """
-        Run validation: encode->decode random unit vectors, measure distortion.
+        Run validation: encode→decode random unit vectors, measure distortion.
         Returns dict with MSE, inner product error, and theory bounds.
         """
         dev = device or self.device
@@ -272,11 +274,11 @@ class TurboQuant:
         x = torch.randn(num_vectors, self.head_dim, device=dev, dtype=torch.float32)
         x = x / x.norm(dim=-1, keepdim=True)
 
-        # Encode -> decode
+        # Encode → decode
         packed, norms = self.encode(x)
         x_hat = self.decode(packed, norms).float()
 
-        # MSE: E[||x - x_hat||^2]
+        # MSE: E[||x - x̂||²]
         mse = (x - x_hat).pow(2).sum(dim=-1).mean().item()
 
         # Inner product error (one-sided quantization)

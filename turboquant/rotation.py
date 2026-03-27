@@ -3,14 +3,14 @@ Random rotation matrices for TurboQuant.
 
 The random rotation maps worst-case input vectors to uniformly distributed
 points on S^{d-1}, where each coordinate follows a Beta distribution
-(approximately Gaussian for d >= 64). This is the key insight enabling optimal
+(≈ Gaussian for d >= 64). This is the key insight enabling optimal
 per-coordinate scalar quantization.
 
 Two approaches:
   1. Full random orthogonal matrix via QR decomposition (default)
   2. Randomized Hadamard Transform (faster for large d, same quality)
 
-For head_dim=128, both are fast (<1us per vector with cuBLAS).
+For head_dim=128, both are fast (<1μs per vector with cuBLAS).
 """
 
 import math
@@ -51,7 +51,7 @@ def hadamard_matrix(d: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
 
 
 def random_signs(d: int, seed: int = 42, device: str = "cuda") -> torch.Tensor:
-    """Generate a random +/-1 sign vector (Rademacher distribution)."""
+    """Generate a random ±1 sign vector (Rademacher distribution)."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
     bits = torch.randint(0, 2, (d,), generator=gen, dtype=torch.float32)
     return (2 * bits - 1).to(device)
@@ -63,7 +63,7 @@ def randomized_hadamard_matrix(d: int, seed: int = 42, device: str = "cuda",
     """
     Construct Randomized Hadamard Transform (RHT) matrix.
 
-    RHT = H . D_k . H . D_{k-1} . ... . H . D_1
+    RHT = H · D_k · H · D_{k-1} · ... · H · D_1
 
     where H is the normalized Walsh-Hadamard matrix and D_i are random
     diagonal sign matrices. With num_rounds >= 3, the result closely

@@ -1,5 +1,5 @@
 """
-Fused TQ Paged Attention -- reads directly from TurboQuant-compressed KV cache.
+Fused TQ Paged Attention — reads directly from TurboQuant-compressed KV cache.
 
 Key optimization: compute attention in the ROTATED domain.
   - Rotate query once:  q_rot = Pi @ q
@@ -16,7 +16,7 @@ interleaving after nibble extraction:
 
 import math
 import torch
-from typing import Optional
+from typing import Optional, Tuple
 
 try:
     import triton
@@ -116,7 +116,7 @@ class TQPagedAttentionRef:
                     n_valid = end - start
 
                     for pos in range(n_valid):
-                        # Unpack K -> full rotated vector via codebook
+                        # Unpack K → full rotated vector via codebook
                         packed_k = k_packed[phys_block, pos, kv_head]
                         k_full = self._unpack_to_full(packed_k)
                         k_even = k_full[0::2]
@@ -211,7 +211,8 @@ if HAS_TRITON:
         if ctx_len == 0:
             return
 
-        # -- Load query and rotate --
+        # ── Load query and rotate ──────────────────────────────────
+        # Process first query head for this KV head (GQA expansion done outside)
         qh = kv_head * gqa_ratio
         q_offs = tl.arange(0, HEAD_DIM)
         q = tl.load(query_ptr + seq_idx * stride_q_seq + qh * stride_q_head + q_offs).to(tl.float32)
@@ -221,16 +222,33 @@ if HAS_TRITON:
         for row in tl.static_range(HEAD_DIM):
             rot_row = tl.load(rotation_ptr + row * stride_rot_row + tl.arange(0, HEAD_DIM))
             q_rot_val = tl.sum(rot_row.to(tl.float32) * q)
+            # Can't do q_rot[row] = ... in Triton, so accumulate via mask
             q_rot += tl.where(q_offs == row, q_rot_val, 0.0)
 
+        # Split even/odd
+        half_offs = tl.arange(0, HALF_DIM)
+        q_rot_even = tl.load(rotation_ptr + 0)  # placeholder — recompute below
+        q_rot_odd = tl.load(rotation_ptr + 0)
+
+        # Actually: gather even/odd from q_rot
+        # Even indices: 0, 2, 4, ...
+        # Odd indices: 1, 3, 5, ...
         even_mask = (q_offs % 2) == 0
         odd_mask = (q_offs % 2) == 1
 
-        # -- Load codebook --
+        # Extract even and odd elements
+        # Since we can't easily index q_rot by computed indices in Triton,
+        # we store q_rot to memory and reload with stride
+        # (This is a workaround for Triton's register indexing limitation)
+
+        # For now, we use the non-split approach: full dot product
+        # (The even/odd split optimization requires careful Triton manipulation)
+
+        # ── Load codebook ──────────────────────────────────────────
         c_offs = tl.arange(0, NUM_LEVELS)
         centroids = tl.load(centroids_ptr + c_offs)
 
-        # -- Online softmax loop over blocks --
+        # ── Online softmax loop over blocks ────────────────────────
         m_i = tl.full([], float("-inf"), dtype=tl.float32)
         l_i = tl.zeros([], dtype=tl.float32)
         acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
@@ -249,26 +267,42 @@ if HAS_TRITON:
                 kp_base = phys * stride_kp_block + pos * stride_kp_pos + kv_head * stride_kp_head
                 kp = tl.load(k_packed_ptr + kp_base + tl.arange(0, PACKED_DIM)).to(tl.int32)
 
-                # Unpack 4-bit -> indices -> codebook lookup
+                # Unpack 4-bit → indices → codebook lookup → full [HEAD_DIM]
                 even_idx = (kp >> 4) & 0xF
                 odd_idx = kp & 0xF
-                k_even = tl.load(centroids_ptr + even_idx)
-                k_odd = tl.load(centroids_ptr + odd_idx)
+                k_even = tl.load(centroids_ptr + even_idx)   # [PACKED_DIM] = [HALF_DIM]
+                k_odd = tl.load(centroids_ptr + odd_idx)     # [HALF_DIM]
 
-                # Dot product score
+                # Reconstruct full HEAD_DIM vector (interleave even/odd)
+                k_full = tl.zeros([HEAD_DIM], dtype=tl.float32)
+                k_full = tl.where(even_mask, tl.load(centroids_ptr + even_idx), k_full)  # placeholder
+                # This interleaving is the hard part in Triton...
+
+                # Simpler approach: dot product with full q_rot and interleaved k
+                # For the first version, compute score via two half-dot-products:
+                # score = sum(q_rot[0::2] * k_even) + sum(q_rot[1::2] * k_odd)
+                # We pre-split q_rot (store to scratch and reload)
+
+                # ── Dot product score ──
                 k_norm = tl.load(k_norms_ptr + phys * stride_kn_block + pos * stride_kn_pos + kv_head)
-                score_even = tl.sum(k_even * q_rot[0::2])
+                # Full dot product (non-split for now):
+                # Interleave k_even and k_odd into [HEAD_DIM]
+                # k_full[0,2,4,...] = k_even[0,1,2,...], k_full[1,3,5,...] = k_odd[0,1,2,...]
+                # score = dot(q_rot, k_full) * k_norm * scale
+
+                # For now use element-wise: manually sum products
+                score_even = tl.sum(k_even * q_rot[0::2])  # Triton may not support this slice
                 score_odd = tl.sum(k_odd * q_rot[1::2])
                 score = (score_even + score_odd) * k_norm * scale
 
-                # Online softmax
+                # ── Online softmax ──
                 m_new = tl.maximum(m_i, score)
                 alpha = tl.exp(m_i - m_new)
                 beta = tl.exp(score - m_new)
                 l_i = alpha * l_i + beta
                 acc = alpha * acc
 
-                # V accumulation
+                # ── V accumulation ──
                 vp_base = phys * stride_kp_block + pos * stride_kp_pos + kv_head * stride_kp_head
                 vp = tl.load(v_packed_ptr + vp_base + tl.arange(0, PACKED_DIM)).to(tl.int32)
                 v_even_idx = (vp >> 4) & 0xF
@@ -277,22 +311,25 @@ if HAS_TRITON:
                 v_odd = tl.load(centroids_ptr + v_odd_idx)
                 v_norm = tl.load(v_norms_ptr + phys * stride_kn_block + pos * stride_kn_pos + kv_head)
 
+                # Accumulate in rotated domain (interleaved)
+                # acc[0::2] += beta * v_norm * v_even
+                # acc[1::2] += beta * v_norm * v_odd
                 bvn = beta * v_norm
-                acc = acc + tl.where(even_mask, bvn * v_even, bvn * v_odd)
+                acc = acc + tl.where(even_mask, bvn * v_even, bvn * v_odd)  # placeholder
 
                 m_i = m_new
 
-        # -- Normalize --
+        # ── Normalize ──
         acc = acc / l_i
 
-        # -- Inverse rotation: output = Pi^T @ acc --
+        # ── Inverse rotation: output = Pi^T @ acc ──
         out = tl.zeros([HEAD_DIM], dtype=tl.float32)
         for col in tl.static_range(HEAD_DIM):
             rot_col = tl.load(rotation_ptr + tl.arange(0, HEAD_DIM) * stride_rot_row + col)
             out_val = tl.sum(rot_col.to(tl.float32) * acc)
             out += tl.where(q_offs == col, out_val, 0.0)
 
-        # -- Store output --
+        # ── Store output ──
         o_base = seq_idx * stride_o_seq + qh * stride_o_head
         tl.store(output_ptr + o_base + q_offs, out.to(tl.float16))
 
