@@ -1,8 +1,7 @@
-# TurboQuant
+# aither-kvcache
 
-Near-optimal KV cache quantization for LLM inference. Implements the algorithm
-from [Zandieh et al., "TurboQuant: Online Vector Quantization with Near-optimal
-Distortion Rate" (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874).
+Near-optimal KV cache quantization for LLM inference. Implements the TurboQuant
+algorithm from [Zandieh et al. (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874).
 
 Compresses KV cache vectors to 2-4 bits per value with MSE within 2.7x of
 the information-theoretic lower bound. No calibration data. No retraining.
@@ -12,15 +11,15 @@ Works online (one vector at a time).
 ## Installation
 
 ```bash
-pip install turboquant
+pip install aither-kvcache
 ```
 
 Optional extras:
 
 ```bash
-pip install turboquant[triton]   # GPU-fused quantize/dequantize kernels
-pip install turboquant[scipy]    # Custom codebook computation via Lloyd-Max
-pip install turboquant[dev]      # pytest for running tests
+pip install aither-kvcache[triton]   # GPU-fused quantize/dequantize kernels
+pip install aither-kvcache[scipy]    # Custom codebook computation via Lloyd-Max
+pip install aither-kvcache[dev]      # pytest for running tests
 ```
 
 
@@ -192,7 +191,7 @@ from turboquant.codebook import compute_codebook_scipy
 centroids, boundaries, mse = compute_codebook_scipy(d=128, bits=3)
 ```
 
-Requires `scipy` (install with `pip install turboquant[scipy]`).
+Requires `scipy` (install with `pip install aither-kvcache[scipy]`).
 
 
 ## Reference
