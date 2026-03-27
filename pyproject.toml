@@ -15,7 +15,6 @@ authors = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: Other/Proprietary License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -35,6 +34,7 @@ all = ["triton>=2.0", "scipy", "pytest"]
 
 [project.urls]
 Paper = "https://arxiv.org/abs/2504.19874"
+Repository = "https://github.com/Aitherium/aitherkvcache"
 
 [tool.setuptools.packages.find]
 include = ["turboquant*"]
