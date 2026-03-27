@@ -30,7 +30,11 @@ dependencies = [
 triton = ["triton>=2.0"]
 scipy = ["scipy"]
 dev = ["pytest"]
+vllm = ["vllm>=0.15"]
 all = ["triton>=2.0", "scipy", "pytest"]
+
+[project.entry-points."vllm.plugins"]
+aither_kvcache = "turboquant.vllm.plugin:register"
 
 [project.urls]
 Paper = "https://arxiv.org/abs/2504.19874"
