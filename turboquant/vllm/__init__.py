@@ -3,7 +3,7 @@ aither-kvcache vLLM integration.
 
 Usage:
     pip install aither-kvcache[vllm]
-    VLLM_ATTENTION_BACKEND=CUSTOM vllm serve ...
+    vllm serve model --attention-backend CUSTOM
 
 Or register manually:
     from turboquant.vllm import register

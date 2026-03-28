@@ -33,18 +33,25 @@ Works with vLLM v0.15+ via the official plugin system. No monkey-patching.
 
 ```bash
 pip install aither-kvcache[vllm]
-VLLM_ATTENTION_BACKEND=CUSTOM vllm serve your-model
+vllm serve your-model --attention-backend CUSTOM
 ```
 
 The plugin auto-registers at startup in all vLLM processes (API server + engine workers)
 via Python entry points. It provides:
 
 - **TurboQuantBackend**: registered as the `CUSTOM` attention backend
-- **TurboQuantImpl**: handles attention using vLLM's Triton kernels + async TQ compression
-- **ColdTierCache**: background GPU-to-CPU transfer + TQ encode on a separate thread, zero sync on the attention hot path
+- **TurboQuantImpl**: fused TQ decode (single-token) + standard Triton prefill (multi-token)
+- **TQGPUCache**: GPU-resident TQ-compressed KV storage with DDR5 cold tier (spill/warm)
+- **ColdTierCache**: Phase 1 fallback — async background GPU-to-CPU TQ encode
 
-Every token is TQ-compressed to a CPU cold tier in the background. The cold tier
-provides `decompress_blocks()` for future block warming (prefix cache from compressed data).
+Decode reads directly from TQ-compressed GPU storage — no decompression buffer.
+~1.88x more KV data fits in VRAM compared to FP8.
+
+```bash
+# Env vars:
+AITHER_TQ_BITS=4     # 2, 3, or 4 (default: 4)
+AITHER_TQ_FUSED=1    # 1 = fused decode (default), 0 = standard fallback
+```
 
 ```python
 # Or register manually in your own code:

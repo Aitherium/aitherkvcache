@@ -1,19 +1,182 @@
 """
-Async TQ cold tier cache for vLLM.
+TurboQuant GPU and cold tier caches for vLLM.
 
-Singleton shared across all attention layers. Background thread handles
-GPU->CPU transfer + TQ encoding. Zero sync on the attention hot path.
+TQGPUCache: Per-layer TQ-compressed KV storage on VRAM with DDR5 cold tier.
+ColdTierCache: Async background thread CPU cold tier (Phase 1 fallback).
 """
 
 import logging
 import os
 import threading
 from collections import deque
-from typing import Optional
+from typing import Optional, Set
 
 import torch
 
 logger = logging.getLogger("turboquant.vllm.cache")
+
+
+# ================================================================
+# TQ GPU CACHE — Phase 2 VRAM-resident compressed KV storage
+# ================================================================
+
+class TQGPUCache:
+    """
+    GPU-resident TQ-compressed KV cache with DDR5 cold tier.
+
+    Stores packed uint8 indices + float32 norms per block/position/head.
+    The fused Triton kernel reads directly from this storage.
+
+    Memory per token (TQ4, 8 heads, 128 dim, 32 layers):
+      2 * 32 * 8 * (64 + 4) = 34,816 bytes = 34 KB
+      vs FP8: 2 * 32 * 8 * 128 = 65,536 bytes = 64 KB
+      Savings: 1.88x
+    """
+
+    def __init__(self, num_layers: int, max_blocks: int, block_size: int,
+                 num_kv_heads: int, head_dim: int, bits: int = 4,
+                 device: str = "cuda"):
+        from turboquant.quantizer import TurboQuant
+        from turboquant.packing import packed_size
+
+        self.tq = TurboQuant(head_dim=head_dim, bits=bits, device=device)
+        self.num_layers = num_layers
+        self.max_blocks = max_blocks
+        self.block_size = block_size
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.packed_dim = packed_size(head_dim, bits)
+
+        # VRAM: contiguous 5D tensors — enables bulk spill/warm
+        self._k_packed = torch.zeros(
+            num_layers, max_blocks, block_size, num_kv_heads, self.packed_dim,
+            dtype=torch.uint8, device=device)
+        self._k_norms = torch.zeros(
+            num_layers, max_blocks, block_size, num_kv_heads,
+            dtype=torch.float32, device=device)
+        self._v_packed = torch.zeros(
+            num_layers, max_blocks, block_size, num_kv_heads, self.packed_dim,
+            dtype=torch.uint8, device=device)
+        self._v_norms = torch.zeros(
+            num_layers, max_blocks, block_size, num_kv_heads,
+            dtype=torch.float32, device=device)
+
+        # Per-layer views (zero-copy, used by fused kernel and encode_and_store)
+        self.k_packed = [self._k_packed[li] for li in range(num_layers)]
+        self.k_norms = [self._k_norms[li] for li in range(num_layers)]
+        self.v_packed = [self._v_packed[li] for li in range(num_layers)]
+        self.v_norms = [self._v_norms[li] for li in range(num_layers)]
+
+        # DDR5 cold tier: contiguous 5D tensors in pinned memory
+        # Probe pinned memory support (WSL2 Docker segfaults on pin_memory=True)
+        try:
+            _can_pin = torch.cuda.is_available() and torch.zeros(1).pin_memory().is_pinned()
+        except Exception:
+            _can_pin = False
+        self._cold_k_packed = torch.zeros(
+            num_layers, max_blocks, block_size, num_kv_heads, self.packed_dim,
+            dtype=torch.uint8, pin_memory=_can_pin)
+        self._cold_k_norms = torch.zeros(
+            num_layers, max_blocks, block_size, num_kv_heads,
+            dtype=torch.float32, pin_memory=_can_pin)
+        self._cold_v_packed = torch.zeros(
+            num_layers, max_blocks, block_size, num_kv_heads, self.packed_dim,
+            dtype=torch.uint8, pin_memory=_can_pin)
+        self._cold_v_norms = torch.zeros(
+            num_layers, max_blocks, block_size, num_kv_heads,
+            dtype=torch.float32, pin_memory=_can_pin)
+        self._cold_valid = torch.zeros(max_blocks, dtype=torch.bool)
+        self._spilled_set: Set[int] = set()
+
+        compressed_mb = (
+            num_layers * 2 * max_blocks * block_size * num_kv_heads
+            * (self.packed_dim + 4) / (1024 ** 2)
+        )
+        logger.info(
+            "TQGPUCache: %d layers x %d blocks @ TQ%d, %.0f MB VRAM + %.0f MB DDR5",
+            num_layers, max_blocks, bits, compressed_mb, compressed_mb,
+        )
+
+    def encode_and_store(self, layer_idx: int, key: torch.Tensor,
+                         value: torch.Tensor, slot_mapping: torch.Tensor):
+        """TQ-encode new K,V tokens and scatter into compressed storage."""
+        valid = slot_mapping >= 0
+        if not valid.any():
+            return
+
+        vs = slot_mapping[valid]
+        vk = key[valid]
+        vv = value[valid]
+
+        N, H, D = vk.shape
+        pd = self.packed_dim
+
+        kp, kn = self.tq.encode(vk.reshape(N * H, D))
+        vp, vn = self.tq.encode(vv.reshape(N * H, D))
+
+        bi = vs // self.block_size
+        oi = vs % self.block_size
+
+        self.k_packed[layer_idx][bi, oi] = kp.reshape(N, H, pd)
+        self.k_norms[layer_idx][bi, oi] = kn.reshape(N, H)
+        self.v_packed[layer_idx][bi, oi] = vp.reshape(N, H, pd)
+        self.v_norms[layer_idx][bi, oi] = vn.reshape(N, H)
+
+    def spill_blocks(self, block_indices: torch.Tensor):
+        """Spill TQ-compressed blocks from VRAM to DDR5 cold tier."""
+        if block_indices.numel() == 0:
+            return
+        bi = block_indices.long()
+        self._cold_k_packed[:, bi] = self._k_packed[:, bi].cpu()
+        self._cold_k_norms[:, bi] = self._k_norms[:, bi].cpu()
+        self._cold_v_packed[:, bi] = self._v_packed[:, bi].cpu()
+        self._cold_v_norms[:, bi] = self._v_norms[:, bi].cpu()
+        self._cold_valid[bi] = True
+        self._spilled_set.update(bi.tolist())
+
+    def warm_blocks(self, block_indices: torch.Tensor):
+        """Warm TQ-compressed blocks from DDR5 cold tier back to VRAM."""
+        if block_indices.numel() == 0:
+            return
+        bi = block_indices.long()
+        valid = self._cold_valid[bi]
+        if not valid.any():
+            return
+        valid_bi = bi[valid]
+        device = self._k_packed.device
+        self._k_packed[:, valid_bi] = self._cold_k_packed[:, valid_bi].to(
+            device, non_blocking=True)
+        self._k_norms[:, valid_bi] = self._cold_k_norms[:, valid_bi].to(
+            device, non_blocking=True)
+        self._v_packed[:, valid_bi] = self._cold_v_packed[:, valid_bi].to(
+            device, non_blocking=True)
+        self._v_norms[:, valid_bi] = self._cold_v_norms[:, valid_bi].to(
+            device, non_blocking=True)
+
+    def cold_tier_stats(self) -> dict:
+        """Report cold tier usage."""
+        valid_blocks = self._cold_valid.sum().item()
+        per_block_bytes = (
+            2 * self.block_size * self.num_kv_heads
+            * (self.packed_dim + 4) * self.num_layers
+        )
+        return {
+            "cold_blocks": valid_blocks,
+            "cold_tokens": valid_blocks * self.block_size,
+            "cold_mb": valid_blocks * per_block_bytes / (1024 ** 2),
+            "max_blocks": self.max_blocks,
+        }
+
+    def has_spilled(self, block_idx: int) -> bool:
+        return block_idx in self._spilled_set
+
+    def clear_spilled(self, block_indices: list) -> None:
+        self._spilled_set.difference_update(block_indices)
+
+
+# ================================================================
+# COLD TIER CACHE — Phase 1 async CPU cold tier
+# ================================================================
 
 _SHARED_COLD_TIER: Optional["ColdTierCache"] = None
 _LOCK = threading.Lock()
@@ -97,14 +260,13 @@ class ColdTierCache:
                        value: torch.Tensor, slot_mapping: torch.Tensor):
         """Queue K,V for background TQ encoding. Returns immediately."""
         try:
-            # Record main-stream event so background can wait
             if self._copy_stream is None and key.is_cuda:
                 self._copy_stream = torch.cuda.Stream(device=key.device)
 
             event = None
             if self._copy_stream is not None:
                 event = torch.cuda.Event()
-                event.record()  # on current (main) stream
+                event.record()
 
             with self._queue_lock:
                 self._queue.append((
@@ -115,7 +277,7 @@ class ColdTierCache:
                     event,
                 ))
         except Exception:
-            pass  # never block hot path
+            pass
 
     def _encode_loop(self):
         """Background: GPU->CPU copy + TQ encode."""
@@ -135,7 +297,6 @@ class ColdTierCache:
                 if event is not None:
                     event.synchronize()
 
-                # GPU -> CPU on copy stream
                 if self._copy_stream is not None:
                     with torch.cuda.stream(self._copy_stream):
                         valid = slot_gpu >= 0
@@ -158,7 +319,6 @@ class ColdTierCache:
                 pd = self.packed_dim
                 S = self.block_size
 
-                # TQ encode
                 kp, kn = self.tq.encode(vk.reshape(N * H, D).contiguous())
                 vp, vn = self.tq.encode(vv.reshape(N * H, D).contiguous())
 

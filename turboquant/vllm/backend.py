@@ -1,15 +1,26 @@
 """
 TurboQuant attention backend for vLLM v0.15+.
 
-Phase 1 (current): delegates to Triton attention for computation,
-adds async TQ cold tier encoding in background.
+Phase 2: Fused TQ decode + standard Triton prefill.
 
-Phase 2 (next): TQPagedAttention for decode, FlashAttn for prefill.
-Phase 3 (future): TQ-native cache allocation, no FP8 buffer.
+Decode (single-token):
+  Fused Triton kernel reads directly from TQ-compressed GPU storage.
+  No decompression buffer. ~1.88x more KV capacity than FP8.
+
+Prefill (multi-token):
+  Standard Triton attention on vLLM's FP8/FP16 cache (delegated to
+  TritonAttentionImpl to avoid raw kernel API drift).
+
+Both paths encode new K,V to TQ GPU storage for decode use.
+Cold tier (DDR5): spill/warm via TQGPUCache.spill_blocks()/warm_blocks().
+
+Activation:
+    vllm serve model --attention-backend CUSTOM
 """
 
 import logging
 import os
+from typing import ClassVar, Optional
 
 import torch
 
@@ -33,9 +44,16 @@ if _VLLM_AVAILABLE:
 
     class TurboQuantBackend(AttentionBackend):
 
+        # Support all KV cache dtypes — TQ encodes from whatever dtype vLLM
+        # stores, so the underlying cache dtype is irrelevant.
+        supported_kv_cache_dtypes = [
+            "auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2",
+        ]
+
         @staticmethod
         def get_name() -> str:
-            return "TURBOQUANT"
+            # Must match AttentionBackendEnum member name
+            return "CUSTOM"
 
         @staticmethod
         def get_impl_cls() -> type["AttentionImpl"]:
@@ -49,20 +67,35 @@ if _VLLM_AVAILABLE:
             return TritonAttentionMetadataBuilder
 
         @staticmethod
+        def get_kv_cache_shape(
+            num_blocks: int,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            cache_dtype_str: str = "auto",
+        ) -> tuple[int, ...]:
+            return (num_blocks, 2, block_size, num_kv_heads, head_size)
+
+        @staticmethod
         def get_supported_head_sizes() -> list[int]:
             return [64, 96, 128, 256]
 
     class TurboQuantImpl(AttentionImpl):
         """
-        Phase 1: Triton attention + async TQ cold tier encoding.
+        TQ attention with fused decode path.
 
-        The actual attention computation delegates to vLLM's Triton kernels
-        (identical output to TRITON_ATTN backend). In parallel, every K,V
-        write is TQ-compressed to a CPU cold tier via a background thread.
-
-        Set AITHER_TQ_BITS=4 (or 2, 3) to control compression bit-width.
-        Default: 4-bit.
+        Env vars:
+          AITHER_TQ_BITS: 2, 3, or 4 (default 4)
+          AITHER_TQ_FUSED: "1" (default) = fused decode, "0" = standard only
         """
+
+        _tq_gpu_cache: ClassVar[Optional["TQGPUCache"]] = None
+        _layer_counter: ClassVar[int] = 0
+        _fused_enabled: ClassVar[bool] = (
+            os.environ.get("AITHER_TQ_FUSED", "1") == "1"
+        )
+        _forward_count: ClassVar[int] = 0
+        _INIT_AFTER_FORWARDS: ClassVar[int] = 2
 
         def __init__(
             self,
@@ -87,44 +120,64 @@ if _VLLM_AVAILABLE:
             self.logits_soft_cap = logits_soft_cap
             self.attn_type = attn_type
 
-            # Triton attention ops (same as TRITON_ATTN backend)
-            from vllm.v1.attention.ops.triton_unified_attention import (
-                unified_attention,
-            )
-            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                triton_reshape_and_cache_flash,
-            )
-            self._reshape_and_cache = triton_reshape_and_cache_flash
-            self._unified_attention = unified_attention
+            self._layer_idx = TurboQuantImpl._layer_counter
+            TurboQuantImpl._layer_counter += 1
 
-            # TQ cold tier (lazy init on first forward)
-            self._cold_tier = None
-            self._tq_bits = int(os.environ.get("AITHER_TQ_BITS", "4"))
-            self._layer_idx = None  # set on first call via instance counter
-            self._encode_ok = True
+            # Delegate standard attention to TritonAttentionImpl
+            from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+            self._triton_impl = TritonAttentionImpl(
+                num_heads=num_heads,
+                head_size=head_size,
+                scale=scale,
+                num_kv_heads=num_kv_heads,
+                alibi_slopes=alibi_slopes,
+                sliding_window=sliding_window,
+                kv_cache_dtype=kv_cache_dtype,
+                logits_soft_cap=logits_soft_cap,
+                attn_type=attn_type,
+            )
 
-        def _ensure_cold_tier(self):
-            """Lazy-init the shared cold tier on first use."""
-            if self._cold_tier is not None:
+            self._fused_attn = None
+
+            mode = "fused+standard" if self._fused_enabled else "standard"
+            logger.info(
+                "TurboQuantImpl[L%d]: heads=%d, kv=%d, dim=%d, mode=%s",
+                self._layer_idx, num_heads, self.num_kv_heads, head_size, mode,
+            )
+
+        def _ensure_tq_cache(self, kv_cache: torch.Tensor):
+            if TurboQuantImpl._tq_gpu_cache is not None:
+                return
+            if TurboQuantImpl._forward_count < TurboQuantImpl._INIT_AFTER_FORWARDS:
                 return
 
-            try:
-                from .cache import get_shared_cold_tier
-                self._cold_tier = get_shared_cold_tier(
-                    head_dim=self.head_size,
-                    num_kv_heads=self.num_kv_heads,
-                    bits=self._tq_bits,
-                )
-                # Assign a layer index
-                self._layer_idx = self._cold_tier.register_layer()
-                logger.info(
-                    "TQ cold tier: layer %d registered (heads=%d, dim=%d, %d-bit)",
-                    self._layer_idx, self.num_kv_heads, self.head_size,
-                    self._tq_bits,
-                )
-            except Exception as e:
-                logger.warning("TQ cold tier init failed: %s", e)
-                self._encode_ok = False
+            if kv_cache.dim() == 5:
+                _, num_blocks, block_size, _, _ = kv_cache.shape
+            else:
+                num_blocks = 2048
+                block_size = 16
+
+            num_layers = TurboQuantImpl._layer_counter
+            bits = int(os.environ.get("AITHER_TQ_BITS", "4"))
+
+            from .cache import TQGPUCache
+            TurboQuantImpl._tq_gpu_cache = TQGPUCache(
+                num_layers=num_layers,
+                max_blocks=num_blocks,
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_size,
+                bits=bits,
+                device=str(kv_cache.device),
+            )
+
+        def _ensure_fused_attn(self):
+            if self._fused_attn is not None:
+                return
+            from turboquant.fused_attention import TQPagedAttention
+            cache = TurboQuantImpl._tq_gpu_cache
+            if cache is not None:
+                self._fused_attn = TQPagedAttention(cache.tq, self.num_heads)
 
         def forward(
             self,
@@ -138,47 +191,81 @@ if _VLLM_AVAILABLE:
             output_scale: torch.Tensor | None = None,
             output_block_scale: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            # --- Standard attention (Triton kernels) ---
+            if self._layer_idx == 0:
+                TurboQuantImpl._forward_count += 1
 
-            # Write new K,V to cache
-            if key is not None and hasattr(attn_metadata, "slot_mapping"):
-                self._reshape_and_cache(
-                    key, value, kv_cache, attn_metadata.slot_mapping,
-                )
+            # Initialize TQ GPU cache (deferred past profiling)
+            if self._fused_enabled:
+                self._ensure_tq_cache(kv_cache)
 
-            # Compute attention
-            num_tokens = query.shape[0]
+            # Encode new K,V to TQ compressed GPU storage
+            tq_cache = TurboQuantImpl._tq_gpu_cache
+            if tq_cache is not None and key is not None:
+                try:
+                    tq_cache.encode_and_store(
+                        self._layer_idx, key, value,
+                        attn_metadata.slot_mapping,
+                    )
+                except Exception as e:
+                    logger.debug("TQ encode error L%d: %s", self._layer_idx, e)
+
+            # -- Decode path: fused TQ kernel --
+            is_decode = (
+                self._fused_enabled
+                and tq_cache is not None
+                and hasattr(attn_metadata, "max_query_len")
+                and attn_metadata.max_query_len == 1
+            )
+
+            if is_decode:
+                try:
+                    self._ensure_fused_attn()
+                    if self._fused_attn is not None:
+                        num_tokens = query.shape[0]
+                        if output is None:
+                            output = torch.empty(
+                                num_tokens, self.num_heads, self.head_size,
+                                dtype=query.dtype, device=query.device,
+                            )
+                        return self._fused_decode(
+                            query, attn_metadata, output)
+                except Exception as e:
+                    logger.debug("TQ fused decode error L%d: %s",
+                                 self._layer_idx, e)
+
+            # -- Prefill / fallback: delegate to TritonAttentionImpl --
             if output is None:
+                num_tokens = query.shape[0]
                 output = torch.empty(
                     num_tokens, self.num_heads, self.head_size,
                     dtype=query.dtype, device=query.device,
                 )
-
-            self._unified_attention(
-                output=output,
-                query=query,
-                key=key,
-                value=value,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
-                num_kv_heads=self.num_kv_heads,
-                scale=self.scale,
-                alibi_slopes=self.alibi_slopes,
-                sliding_window=self.sliding_window,
-                logits_soft_cap=self.logits_soft_cap,
+            return self._triton_impl.forward(
+                layer, query, key, value, kv_cache, attn_metadata,
+                output=output, output_scale=output_scale,
+                output_block_scale=output_block_scale,
             )
 
-            # --- Async TQ cold tier encode (after attention, non-blocking) ---
-            if key is not None and self._encode_ok:
-                self._ensure_cold_tier()
-                if self._cold_tier is not None and self._layer_idx is not None:
-                    try:
-                        slot_mapping = getattr(attn_metadata, "slot_mapping", None)
-                        if slot_mapping is not None:
-                            self._cold_tier.compress_async(
-                                self._layer_idx, key, value, slot_mapping,
-                            )
-                    except Exception:
-                        pass  # never block attention
+        def _fused_decode(
+            self,
+            query: torch.Tensor,
+            attn_metadata,
+            output: torch.Tensor,
+        ) -> torch.Tensor:
+            tq_cache = TurboQuantImpl._tq_gpu_cache
+            li = self._layer_idx
 
+            fused_out = self._fused_attn.forward(
+                query=query,
+                k_packed=tq_cache.k_packed[li],
+                k_norms=tq_cache.k_norms[li],
+                v_packed=tq_cache.v_packed[li],
+                v_norms=tq_cache.v_norms[li],
+                block_tables=attn_metadata.block_table,
+                context_lens=attn_metadata.seq_lens,
+                block_size=tq_cache.block_size,
+                num_kv_heads=self.num_kv_heads,
+            )
+
+            output[:] = fused_out
             return output
