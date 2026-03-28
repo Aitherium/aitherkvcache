@@ -1,12 +1,23 @@
 """
-TurboQuant Benchmark -- Validate correctness and measure performance.
+TurboQuant Benchmark — Validate correctness and measure performance.
 
 Run directly:
-    python -m turboquant.bench
+    python -m lib.gpu.turboquant.bench
+
+Or from repo root:
+    python AitherOS/lib/gpu/turboquant/bench.py
 """
 
+import sys
+import os
+import time
+
+# Allow running from repo root
+if os.path.exists("AitherOS"):
+    sys.path.insert(0, "AitherOS")
+
 import torch
-from turboquant import TurboQuant
+from lib.gpu.turboquant import TurboQuant, TurboQuantConfig
 
 
 def banner(text: str):
@@ -66,9 +77,9 @@ def run_memory_report():
     banner("KV CACHE MEMORY REPORT")
 
     configs = [
-        ("Llama-3.1-8B", 32, 8, 128),
-        ("Llama-3.1-70B", 80, 8, 128),
-        ("Mistral-7B", 32, 8, 128),
+        ("Nemotron-8B (orchestrator)", 32, 8, 128),
+        ("DeepSeek-R1-14B (reasoning)", 40, 8, 128),
+        ("Llama-3.1-70B (supernode)", 80, 8, 128),
     ]
 
     for model_name, num_layers, num_kv_heads, head_dim in configs:
@@ -94,18 +105,21 @@ def run_memory_report():
 
 
 def run_context_impact():
-    banner("CONTEXT WINDOW IMPACT (32GB GPU)")
+    banner("CONTEXT WINDOW IMPACT (RTX 5090, 32GB)")
+
+    # Rough model: available_kv_vram = total_vram * util - model_weights
+    # KV per token = 2 * num_layers * num_kv_heads * head_dim * bytes_per_value
 
     scenarios = [
         {
-            "name": "Llama-3.1-8B (gpu_util=0.90)",
-            "vram_gb": 32, "util": 0.90, "weights_gb": 4.5,
+            "name": "Nemotron-8B Orchestrator (util=0.40)",
+            "vram_gb": 32, "util": 0.40, "weights_gb": 4.5,
             "num_layers": 32, "num_kv_heads": 8, "head_dim": 128,
         },
         {
-            "name": "Llama-3.1-70B (gpu_util=0.90, tensor parallel)",
+            "name": "DeepSeek-R1-14B Reasoning (util=0.90, enforce-eager)",
             "vram_gb": 32, "util": 0.90, "weights_gb": 9.4,
-            "num_layers": 80, "num_kv_heads": 8, "head_dim": 128,
+            "num_layers": 40, "num_kv_heads": 8, "head_dim": 128,
         },
     ]
 
@@ -126,7 +140,7 @@ def run_context_impact():
 
 
 if __name__ == "__main__":
-    print("TurboQuant v0.1.0 -- KV Cache Quantization Benchmark")
+    print("TurboQuant v0.1.0 — KV Cache Quantization Benchmark")
     print("Paper: arXiv:2504.19874 (Zandieh et al., 2025)")
 
     run_validation()

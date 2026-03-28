@@ -1,5 +1,5 @@
 """
-TurboQuant Codebook -- Optimal Lloyd-Max scalar quantizers for sphere coordinates.
+TurboQuant Codebook — Optimal Lloyd-Max scalar quantizers for sphere coordinates.
 
 Precomputed codebooks for the Beta distribution of coordinates on S^{d-1}.
 For d >= 64, the Gaussian approximation N(0, 1/d) is excellent.
@@ -160,7 +160,7 @@ def compute_codebook_scipy(d: int, bits: int, max_iter: int = 2000,
         val, _ = quad(lambda x, c=centroids[i]: (x - c) ** 2 * pdf(x),
                       boundaries[i], boundaries[i + 1])
         mse_total += val
-    mse_total *= d  # per-coord MSE x d = total MSE
+    mse_total *= d  # per-coord MSE × d = total MSE
 
     boundaries_inner = _compute_boundaries(centroids)
     return centroids, boundaries_inner, mse_total

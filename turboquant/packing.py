@@ -2,9 +2,9 @@
 Bit packing/unpacking for TurboQuant quantized indices.
 
 Packs low-bit indices into uint8 bytes for memory-efficient storage:
-  4-bit: 2 values per byte  -> head_dim/2 bytes per vector
-  3-bit: 8 values per 3 bytes -> head_dim*3/8 bytes per vector
-  2-bit: 4 values per byte  -> head_dim/4 bytes per vector
+  4-bit: 2 values per byte  → head_dim/2 bytes per vector
+  3-bit: 8 values per 3 bytes → head_dim*3/8 bytes per vector
+  2-bit: 4 values per byte  → head_dim/4 bytes per vector
 """
 
 import torch
@@ -84,7 +84,7 @@ def pack_3bit(indices: torch.Tensor) -> torch.Tensor:
     groups = D // 8
     idx = indices.to(torch.int32).reshape(*indices.shape[:-1], groups, 8)
 
-    # Pack 8 x 3-bit values into a 24-bit integer
+    # Pack 8 × 3-bit values into a 24-bit integer
     bits24 = torch.zeros(*idx.shape[:-1], dtype=torch.int32, device=indices.device)
     for i in range(8):
         bits24 = bits24 | ((idx[..., i] & 0x7) << (21 - i * 3))
