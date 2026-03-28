@@ -45,7 +45,7 @@ via Python entry points. It provides:
 - **ColdTierCache**: Phase 1 fallback — async background GPU-to-CPU TQ encode
 
 Decode reads directly from TQ-compressed GPU storage — no decompression buffer.
-~1.88x more KV data fits in VRAM compared to FP8.
+3.8x compression vs FP16 at 4-bit, up to 7.1x at 2-bit (1.9x vs FP8 at 4-bit).
 
 ```bash
 # Env vars:
