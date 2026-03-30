@@ -1,5 +1,5 @@
 """
-Fused TQ Paged Attention -- reads directly from TurboQuant-compressed KV cache.
+Fused TQ Paged Attention — reads directly from TurboQuant-compressed KV cache.
 
 Key optimization: compute attention in the ROTATED domain.
   - Rotate query once:  q_rot = Pi @ q
@@ -29,11 +29,12 @@ Architecture (Triton path):
     5. Interleave acc_even, acc_odd -> out_rot
     6. output = out_rot @ rotation            (inverse rotation)
 
-This completely avoids Triton's register-indexing limitations -- no computed
+This completely avoids Triton's register-indexing limitations — no computed
 indices, no stride slicing, no in-kernel matmul. All arrays are [HALF_D].
 """
 
 import math
+import os
 import torch
 from typing import Optional
 
@@ -135,7 +136,7 @@ class TQPagedAttentionRef:
                     n_valid = end - start
 
                     for pos in range(n_valid):
-                        # Unpack K -> full rotated vector via codebook
+                        # Unpack K → full rotated vector via codebook
                         packed_k = k_packed[phys_block, pos, kv_head]
                         k_full = self._unpack_to_full(packed_k)
                         k_even = k_full[0::2]
@@ -248,7 +249,7 @@ if HAS_TRITON:
         Each program computes attention for one query head over one sequence's
         entire compressed KV context using online softmax.
 
-        All register arrays are [HALF_D] -- no computed indexing needed.
+        All register arrays are [HALF_D] — no computed indexing needed.
         """
         qh = tl.program_id(0)
         seq_idx = tl.program_id(1)
@@ -291,7 +292,7 @@ if HAS_TRITON:
                 for pos in tl.static_range(BLOCK_SIZE):
                     token_idx = blk * BLOCK_SIZE + pos
                     if token_idx < ctx_len:
-                        # ── Unpack K: nibbles -> codebook gather ──
+                        # ── Unpack K: nibbles → codebook gather ──
                         kp_base = (phys_block * stride_kp_block
                                    + pos * stride_kp_pos
                                    + kv_head * stride_kp_head)
@@ -577,6 +578,20 @@ class TQPagedAttention:
         )
 
         self._use_triton = HAS_TRITON and torch.cuda.is_available() and tq.bits == 4
+        if self._use_triton:
+            try:
+                cap = torch.cuda.get_device_capability()
+                if cap[0] >= 10:  # Blackwell SM_100+
+                    if os.environ.get("AITHER_TQ_FORCE_TRITON", "0") != "1":
+                        import logging
+                        logging.getLogger("aither.turboquant.fused").info(
+                            "TQPagedAttention: SM_%d%d — using PyTorch reference "
+                            "(set AITHER_TQ_FORCE_TRITON=1 to test Triton)",
+                            cap[0] * 10, cap[1],
+                        )
+                        self._use_triton = False
+            except Exception:
+                pass
 
     def forward(
         self,
@@ -616,7 +631,7 @@ class TQPagedAttention:
     # Split-k threshold: use split-k for contexts with more blocks than this.
     # Below this, the single-program kernel has less overhead.
     SPLITK_THRESHOLD = 128  # 128 blocks = 2048 tokens at block_size=16
-    SPLITK_NUM_SPLITS = 8  # 8 splits -> 8x more GPU parallelism
+    SPLITK_NUM_SPLITS = 8  # 8 splits → 8x more GPU parallelism
 
     def _triton_forward(
         self,

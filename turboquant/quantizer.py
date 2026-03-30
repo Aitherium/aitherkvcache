@@ -134,8 +134,10 @@ class TurboQuant:
         assert x.shape[-1] == self.head_dim, \
             f"Expected last dim {self.head_dim}, got {x.shape[-1]}"
 
-        # Flatten to [N, D]
-        x_flat = x.reshape(-1, self.head_dim).float()
+        # Flatten to [N, D] — force contiguous for safe matmul/Triton ops.
+        # vLLM's paged KV cache passes strided views; non-contiguous tensors
+        # cause CUDA segfaults on Blackwell (sm_100) in matmul and Triton JIT.
+        x_flat = x.reshape(-1, self.head_dim).float().contiguous()
         N = x_flat.shape[0]
 
         # 1) Compute norms
@@ -145,10 +147,23 @@ class TurboQuant:
         x_norm = x_flat / (norms.unsqueeze(-1) + 1e-10)
 
         # 3) Random rotation: y = x_norm @ Π^T
-        y = torch.matmul(x_norm, self.rotation.T)
+        y = torch.matmul(x_norm, self.rotation.T).contiguous()
 
-        # 4-5) Quantize + pack
-        if self._use_triton and x.is_cuda:
+        # 4-5) Quantize + pack (disable Triton on sm_100+ until validated)
+        use_triton = self._use_triton and x.is_cuda
+        if use_triton:
+            try:
+                cap = torch.cuda.get_device_capability(x.device)
+                if cap[0] >= 10:  # Blackwell sm_100+
+                    # Triton quantize/dequantize ops not validated on SM_100+.
+                    # Override: AITHER_TQ_FORCE_TRITON=1 to test on Blackwell.
+                    import os
+                    if os.environ.get("AITHER_TQ_FORCE_TRITON", "0") != "1":
+                        use_triton = False
+            except Exception:
+                pass
+
+        if use_triton:
             packed = self._triton_encode(y)
         else:
             packed = self._pytorch_encode(y)

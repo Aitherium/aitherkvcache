@@ -106,7 +106,8 @@ The math: rotate the query forward once, dot-product in the rotated domain again
 codebook-decoded values, accumulate weighted values in the rotated domain, rotate back
 once. Two matrix multiplies total regardless of context length.
 
-This is a PyTorch reference implementation. A production Triton kernel is next.
+Uses fused Triton kernels on GPU (Ampere through Blackwell). Falls back to PyTorch reference on CPU.
+Set `AITHER_TQ_FORCE_TRITON=1` on Blackwell (SM_120) GPUs -- validated on RTX 5090 at 26 tok/s.
 
 ### Research / benchmarking
 

@@ -24,4 +24,4 @@ Usage:
 from .quantizer import TurboQuant, TurboQuantConfig
 
 __all__ = ["TurboQuant", "TurboQuantConfig"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"
