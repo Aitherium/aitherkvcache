@@ -1,27 +1,33 @@
 """
-TurboQuant — Near-optimal KV cache quantization for AitherOS.
+TurboQuant — Near-optimal KV cache quantization for LLM inference.
 
 Implements the TurboQuant algorithm from Zandieh et al. (arXiv:2504.19874):
 random rotation -> optimal scalar quantization -> bit packing.
 
-Achieves 3.5-bit KV cache compression with zero accuracy loss,
-within 2.7x of the information-theoretic optimum.
+Two quantizer variants:
+  TurboQuant       — uniform bit-width (2/3/4-bit), data-oblivious
+  HybridTurboQuant — split-group (tq35/tq25), variance-based + QJL residual
 
 Usage:
-    from lib.gpu.turboquant import TurboQuant
+    from turboquant import TurboQuant, HybridTurboQuant
 
+    # Uniform 4-bit
     tq = TurboQuant(head_dim=128, bits=4, device='cuda')
     packed, norms = tq.encode(kv_vectors)
     decoded = tq.decode(packed, norms)
 
-    # Validate correctness
-    print(tq.validate())
-
-    # Memory savings report
-    print(tq.memory_report(seq_len=40000, num_layers=32, num_kv_heads=8))
+    # Hybrid 3.5-bit (better quality, same compression as TQ4)
+    htq = HybridTurboQuant(head_dim=128, mode='tq35', device='cuda')
+    htq.calibrate_uniform()  # or htq.calibrate(sample_data)
+    packed = htq.encode(kv_vectors)
+    decoded = htq.decode(packed)
 """
 
 from .quantizer import TurboQuant, TurboQuantConfig
+from .hybrid_quantizer import HybridTurboQuant, HybridLayout, GroupLayout
 
-__all__ = ["TurboQuant", "TurboQuantConfig"]
-__version__ = "0.6.0"
+__all__ = [
+    "TurboQuant", "TurboQuantConfig",
+    "HybridTurboQuant", "HybridLayout", "GroupLayout",
+]
+__version__ = "0.7.0"
