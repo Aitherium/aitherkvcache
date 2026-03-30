@@ -49,9 +49,13 @@ Decode reads directly from TQ-compressed GPU storage — no decompression buffer
 
 ```bash
 # Env vars:
-AITHER_TQ_BITS=4     # 2, 3, or 4 (default: 4)
-AITHER_TQ_FUSED=1    # 1 = fused decode (default), 0 = standard fallback
+AITHER_TQ_BITS=4              # 2, 3, or 4 (default: 4)
+AITHER_TQ_FUSED=1             # 1 = fused decode, 0 = standard fallback
+AITHER_TQ_EAGER=0             # 0 = torch.compile+CUDA graphs (recommended)
+AITHER_TQ_FORCE_TRITON=1      # Required on Blackwell (SM_100+)
 ```
+
+**Validated**: 64 tok/s decode on RTX 5090 (Blackwell SM_120), 138 tok/s at 10 concurrent.
 
 ```python
 # Or register manually in your own code:
