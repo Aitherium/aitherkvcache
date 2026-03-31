@@ -550,11 +550,12 @@ class TQPagedAttention:
                               block_tables, context_lens)
     """
 
-    def __init__(self, tq, num_query_heads: int):
+    def __init__(self, tq, num_query_heads: int, block_selector=None):
         """
         Args:
             tq: TurboQuant instance (has rotation, centroids, head_dim, etc.)
             num_query_heads: total query heads (for GQA mapping)
+            block_selector: optional BlockSelector for sparse block attention
         """
         self.rotation = tq.rotation
         self.rotation_T = tq.rotation.T.contiguous()  # pre-transposed, contiguous
@@ -577,6 +578,9 @@ class TQPagedAttention:
             block_size=16,
             bits=tq.bits,
         )
+
+        # Block selector for sparse attention (optional)
+        self._block_selector = block_selector
 
         # Pre-allocated buffers for decode (reused across calls)
         self._out_even_buf = None
@@ -655,6 +659,13 @@ class TQPagedAttention:
         q_rot = torch.matmul(query.float(), self.rotation_T)
         q_even = q_rot[..., 0::2].contiguous()
         q_odd = q_rot[..., 1::2].contiguous()
+
+        # ── Step 1b: Block selection (sparse attention) ────────────
+        if self._block_selector is not None:
+            block_tables, context_lens = self._block_selector.select(
+                q_even, q_odd, block_tables, context_lens,
+                gqa_ratio, block_size)
+            max_blocks_per_seq = block_tables.shape[1]
 
         # Reuse output buffers across decode calls (shapes are fixed)
         out_shape = (num_seqs, num_q_heads, half_d)
