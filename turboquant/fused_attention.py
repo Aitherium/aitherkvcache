@@ -34,6 +34,7 @@ indices, no stride slicing, no in-kernel matmul. All arrays are [HALF_D].
 """
 
 import math
+import os
 import torch
 from typing import Optional
 
@@ -556,6 +557,7 @@ class TQPagedAttention:
             num_query_heads: total query heads (for GQA mapping)
         """
         self.rotation = tq.rotation
+        self.rotation_T = tq.rotation.T.contiguous()  # pre-transposed, contiguous
         self.centroids = tq.centroids
         self.scale = 1.0 / math.sqrt(tq.head_dim)
         self.head_dim = tq.head_dim
@@ -575,6 +577,11 @@ class TQPagedAttention:
             block_size=16,
             bits=tq.bits,
         )
+
+        # Pre-allocated buffers for decode (reused across calls)
+        self._out_even_buf = None
+        self._out_odd_buf = None
+        self._out_rot_buf = None
 
         # Auto-enable Triton on all CUDA architectures including Blackwell (SM_100+).
         # No env var needed — Triton auto-detects SM version at JIT time.
@@ -617,8 +624,9 @@ class TQPagedAttention:
 
     # Split-k threshold: use split-k for contexts with more blocks than this.
     # Below this, the single-program kernel has less overhead.
-    SPLITK_THRESHOLD = 128  # 128 blocks = 2048 tokens at block_size=16
-    SPLITK_NUM_SPLITS = 8  # 8 splits → 8x more GPU parallelism
+    # Tunable via env: AITHER_TQ_SPLITK_THRESHOLD (default 64), AITHER_TQ_SPLITK_SPLITS (default 16)
+    SPLITK_THRESHOLD = int(os.environ.get("AITHER_TQ_SPLITK_THRESHOLD", "64"))
+    SPLITK_NUM_SPLITS = int(os.environ.get("AITHER_TQ_SPLITK_SPLITS", "16"))
 
     def _triton_forward(
         self,
@@ -644,12 +652,18 @@ class TQPagedAttention:
         max_blocks_per_seq = block_tables.shape[1]
 
         # ── Step 1: Pre-rotate query, split even/odd ──────────────
-        q_rot = torch.matmul(query.float(), self.rotation.T)
+        q_rot = torch.matmul(query.float(), self.rotation_T)
         q_even = q_rot[..., 0::2].contiguous()
         q_odd = q_rot[..., 1::2].contiguous()
 
-        out_even = torch.empty_like(q_even)
-        out_odd = torch.empty_like(q_odd)
+        # Reuse output buffers across decode calls (shapes are fixed)
+        out_shape = (num_seqs, num_q_heads, half_d)
+        if self._out_even_buf is None or self._out_even_buf.shape != out_shape:
+            self._out_even_buf = torch.empty(
+                out_shape, dtype=torch.float32, device=query.device)
+            self._out_odd_buf = torch.empty_like(self._out_even_buf)
+        out_even = self._out_even_buf
+        out_odd = self._out_odd_buf
 
         # ── Step 2: Choose kernel based on context length ─────────
         use_splitk = max_blocks_per_seq >= self.SPLITK_THRESHOLD
@@ -711,10 +725,11 @@ class TQPagedAttention:
             )
 
         # ── Step 3: Interleave + inverse rotation ─────────────────
-        out_rot = torch.empty(
-            num_seqs, num_q_heads, head_dim,
-            device=query.device, dtype=torch.float32,
-        )
+        rot_shape = (num_seqs, num_q_heads, head_dim)
+        if self._out_rot_buf is None or self._out_rot_buf.shape != rot_shape:
+            self._out_rot_buf = torch.empty(
+                rot_shape, device=query.device, dtype=torch.float32)
+        out_rot = self._out_rot_buf
         out_rot[..., 0::2] = out_even
         out_rot[..., 1::2] = out_odd
 
