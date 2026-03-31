@@ -349,19 +349,8 @@ def fused_tq4_kv_update(
 
     half_d = head_dim // 2
 
-    # Dispatch: Triton on CUDA with supported SM, else PyTorch fallback
+    # Dispatch: Triton on CUDA (all SMs including Blackwell SM_100+)
     use_triton = HAS_TRITON and x.is_cuda
-    if use_triton:
-        try:
-            cap = torch.cuda.get_device_capability(x.device)
-            if cap[0] >= 10:
-                # SM_100+ (Blackwell): not validated for fused kernel.
-                # Override with AITHER_TQ_FORCE_TRITON=1.
-                import os
-                if os.environ.get("AITHER_TQ_FORCE_TRITON", "0") != "1":
-                    use_triton = False
-        except Exception:
-            pass
 
     if use_triton:
         # Ensure contiguous layout for Triton pointer arithmetic

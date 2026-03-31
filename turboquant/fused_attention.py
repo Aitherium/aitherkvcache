@@ -34,7 +34,6 @@ indices, no stride slicing, no in-kernel matmul. All arrays are [HALF_D].
 """
 
 import math
-import os
 import torch
 from typing import Optional
 
@@ -577,21 +576,9 @@ class TQPagedAttention:
             bits=tq.bits,
         )
 
+        # Auto-enable Triton on all CUDA architectures including Blackwell (SM_100+).
+        # No env var needed — Triton auto-detects SM version at JIT time.
         self._use_triton = HAS_TRITON and torch.cuda.is_available() and tq.bits == 4
-        if self._use_triton:
-            try:
-                cap = torch.cuda.get_device_capability()
-                if cap[0] >= 10:  # Blackwell SM_100+
-                    if os.environ.get("AITHER_TQ_FORCE_TRITON", "0") != "1":
-                        import logging
-                        logging.getLogger("aither.turboquant.fused").info(
-                            "TQPagedAttention: SM_%d%d — using PyTorch reference "
-                            "(set AITHER_TQ_FORCE_TRITON=1 to test Triton)",
-                            cap[0] * 10, cap[1],
-                        )
-                        self._use_triton = False
-            except Exception:
-                pass
 
     def forward(
         self,

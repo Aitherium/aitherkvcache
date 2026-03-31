@@ -107,7 +107,7 @@ class TurboQuant:
         self._unpack_fn = {2: unpack_2bit, 3: unpack_3bit, 4: unpack_4bit}[config.bits]
         self._packed_dim = packed_size(config.head_dim, config.bits)
 
-        # Try Triton kernels
+        # Try Triton kernels (auto-enabled on Blackwell SM_100+)
         self._use_triton = False
         if config.use_triton:
             try:
@@ -149,19 +149,9 @@ class TurboQuant:
         # 3) Random rotation: y = x_norm @ Π^T
         y = torch.matmul(x_norm, self.rotation.T).contiguous()
 
-        # 4-5) Quantize + pack (disable Triton on sm_100+ until validated)
+        # 4-5) Quantize + pack
+        # Blackwell (SM_100+) auto-detected at init — Triton enabled automatically.
         use_triton = self._use_triton and x.is_cuda
-        if use_triton:
-            try:
-                cap = torch.cuda.get_device_capability(x.device)
-                if cap[0] >= 10:  # Blackwell sm_100+
-                    # Triton quantize/dequantize ops not validated on SM_100+.
-                    # Override: AITHER_TQ_FORCE_TRITON=1 to test on Blackwell.
-                    import os
-                    if os.environ.get("AITHER_TQ_FORCE_TRITON", "0") != "1":
-                        use_triton = False
-            except Exception:
-                pass
 
         if use_triton:
             packed = self._triton_encode(y)
