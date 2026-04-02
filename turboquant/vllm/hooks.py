@@ -86,6 +86,110 @@ _prefill_k_buf: Optional[torch.Tensor] = None
 _prefill_v_buf: Optional[torch.Tensor] = None
 _PREFILL_BUF_BLOCKS = 512
 
+# Custom op flag — set by _register_custom_ops()
+_USE_CUSTOM_OP = False
+
+
+# ── Custom op: zero graph breaks, CUDA-graphable ────────────────────
+
+def _register_custom_ops():
+    """Register TQ decode as a torch custom op (PyTorch 2.4+).
+    Eliminates ALL graph breaks from decode — enables CUDA graph capture."""
+    global _USE_CUSTOM_OP
+
+    if not hasattr(torch.library, "custom_op"):
+        logger.info("TQ custom op: torch.library.custom_op not available "
+                     "(need PyTorch 2.4+), using graph-break fallback")
+        return
+
+    try:
+        @torch.library.custom_op("tq::decode_step",
+                                  mutates_args=("kv_cache", "output",
+                                                "k_norms", "v_norms"))
+        def _decode_step_op(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            kv_cache: torch.Tensor,
+            output: torch.Tensor,
+            k_norms: torch.Tensor,
+            v_norms: torch.Tensor,
+            slot_mapping: torch.Tensor,
+            block_table: torch.Tensor,
+            seq_lens: torch.Tensor,
+            layer_idx: int,
+            num_heads: int,
+            num_kv_heads: int,
+            head_size: int,
+            scale: float,
+            num_actual: int,
+        ) -> torch.Tensor:
+            """Encode new token + fused TQ attention. No graph break.
+            Accesses module globals (_tq_quantizer, _tq_fused_attn) in body —
+            these are initialized during vLLM warmup before CUDA graph capture."""
+            tq = _tq_quantizer
+            packed_dim = head_size // 2
+            key_cache = kv_cache[:, 0]
+            value_cache = kv_cache[:, 1]
+            block_size = key_cache.shape[1]
+
+            # Encode — branchless, no CPU-GPU sync
+            bi = slot_mapping // block_size
+            oi = slot_mapping % block_size
+            N, H, D = key.shape
+
+            kp, kn = tq.encode(key.reshape(N * H, D))
+            vp, vn = tq.encode(value.reshape(N * H, D))
+
+            kp = kp.reshape(N, H, packed_dim)
+            vp = vp.reshape(N, H, packed_dim)
+
+            key_cache[bi, oi, :, :packed_dim] = kp
+            value_cache[bi, oi, :, :packed_dim] = vp
+
+            k_norms[layer_idx, bi, oi] = kn.reshape(N, H).to(torch.float32)
+            v_norms[layer_idx, bi, oi] = vn.reshape(N, H).to(torch.float32)
+
+            _stats.encode_calls += 1
+            _stats.encode_tokens += N
+
+            # Fused attention (lazy-init persists across CUDA graph replay)
+            fused = _tq_fused_attn.get(layer_idx)
+            if fused is None:
+                from .fused_attention import TQPagedAttention
+                fused = TQPagedAttention(tq, num_heads)
+                _tq_fused_attn[layer_idx] = fused
+
+            fused_out = fused.forward(
+                query=query[:num_actual],
+                k_packed=key_cache[:, :, :, :packed_dim],
+                k_norms=k_norms[layer_idx],
+                v_packed=value_cache[:, :, :, :packed_dim],
+                v_norms=v_norms[layer_idx],
+                block_tables=block_table,
+                context_lens=seq_lens,
+            )
+            output[:num_actual] = fused_out.to(output.dtype)
+            return output
+
+        @_decode_step_op.register_fake
+        def _decode_step_fake(
+            query, key, value, kv_cache, output, k_norms, v_norms,
+            slot_mapping, block_table, seq_lens,
+            layer_idx, num_heads, num_kv_heads, head_size, scale,
+            num_actual,
+        ):
+            """Shape inference for torch.compile tracing."""
+            return output
+
+        _USE_CUSTOM_OP = True
+        logger.info("TQ custom op registered: tq::decode_step "
+                     "(zero graph breaks, CUDA-graphable)")
+    except Exception as e:
+        logger.warning("TQ custom op registration failed: %s — "
+                       "using graph-break fallback", e)
+        _USE_CUSTOM_OP = False
+
 
 # ── Helpers (run eagerly, create graph breaks) ──────────────────────
 
@@ -492,11 +596,37 @@ def _make_tq_forward(original_fwd):
 
     def tq_forward(self, layer, query, key, value, kv_cache, attn_metadata,
                    output=None, output_scale=None, output_block_scale=None):
+        # ═══ FAST PATH: decode via custom op (Dynamo-traceable, CUDA-graphable) ═══
+        # No try/except, no init, no graph breaks. Dynamo can trace straight through.
+        # Runs during BOTH normal execution AND CUDA graph capture.
+        # Falls through to slow path for: init, prefill, missing key/value.
+        if (_USE_CUSTOM_OP
+                and hasattr(self, '_tq_layer_idx')
+                and _tq_quantizer is not None
+                and _primary_k_norms is not None
+                and attn_metadata is not None
+                and output is not None
+                and key is not None and value is not None
+                and hasattr(attn_metadata, 'max_query_len')
+                and attn_metadata.max_query_len == 1):
+            num_actual = attn_metadata.num_actual_tokens
+            return torch.ops.tq.decode_step(
+                query, key[:num_actual], value[:num_actual],
+                kv_cache, output,
+                _primary_k_norms, _primary_v_norms,
+                attn_metadata.slot_mapping,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                self._tq_layer_idx,
+                self.num_heads, self.num_kv_heads,
+                self.head_size, self.scale, num_actual)
+
+        # ═══ SLOW PATH: init, prefill, fallback ═══
         # --- Layer init (once per instance, guarded to avoid graph break) ---
         if not hasattr(self, '_tq_layer_idx'):
             _tq_init_layer(self)
 
-        # --- CUDA graph capture / profiling: bypass TQ entirely ---
+        # --- CUDA graph capture bypass (slow path only — fast path handles capture) ---
         if attn_metadata is None or torch.cuda.is_current_stream_capturing():
             if output is not None:
                 output.fill_(0)
@@ -558,9 +688,7 @@ def _make_tq_forward(original_fwd):
                      f"enc_tok={_stats.encode_tokens}, "
                      f"blocks={sorted(_stats.encode_blocks)}")
 
-        # --- Phase 2a: Merged decode (single graph break: encode + fused) ---
-        # Halves graph breaks from 72->36 per token by combining encode +
-        # fused attention into one @torch.compiler.disable call.
+        # --- Phase 2a: Decode (custom op = zero graph breaks, or fallback) ---
         if is_decode and _tq_quantizer is not None:
             num_actual = attn_metadata.num_actual_tokens
             try:
@@ -569,21 +697,41 @@ def _make_tq_forward(original_fwd):
                         tq_forward._dec_times = []
                     import time as _time
                     _t0 = _time.perf_counter()
-                result = _tq_decode_step(
-                    self._tq_layer_idx, query,
-                    key[:num_actual] if key is not None else None,
-                    value[:num_actual] if value is not None else None,
-                    kv_cache, attn_metadata, output,
-                    self.num_heads, self.num_kv_heads,
-                    self.head_size, self.scale)
+
+                if (_USE_CUSTOM_OP and key is not None and value is not None
+                        and _primary_k_norms is not None):
+                    # Zero graph breaks — CUDA-graphable
+                    result = torch.ops.tq.decode_step(
+                        query,
+                        key[:num_actual], value[:num_actual],
+                        kv_cache, output,
+                        _primary_k_norms, _primary_v_norms,
+                        attn_metadata.slot_mapping,
+                        attn_metadata.block_table,
+                        attn_metadata.seq_lens,
+                        self._tq_layer_idx,
+                        self.num_heads, self.num_kv_heads,
+                        self.head_size, self.scale,
+                        num_actual)
+                else:
+                    # Fallback: 1 graph break per layer
+                    result = _tq_decode_step(
+                        self._tq_layer_idx, query,
+                        key[:num_actual] if key is not None else None,
+                        value[:num_actual] if value is not None else None,
+                        kv_cache, attn_metadata, output,
+                        self.num_heads, self.num_kv_heads,
+                        self.head_size, self.scale)
+
                 if _TQ_DEBUG and self._tq_layer_idx == 0:
                     tq_forward._dec_times.append((_time.perf_counter() - _t0) * 1000)
                     if len(tq_forward._dec_times) == 50:
                         avg = sum(tq_forward._dec_times) / len(tq_forward._dec_times)
-                        _dbg(f"MERGED_DECODE avg={avg:.2f}ms over 50 calls")
+                        mode = "CUSTOM_OP" if _USE_CUSTOM_OP else "GRAPH_BREAK"
+                        _dbg(f"{mode}_DECODE avg={avg:.2f}ms over 50 calls")
                 return result
             except Exception as e:
-                logger.error("TQ merged decode error L%d: %s",
+                logger.error("TQ decode error L%d: %s",
                              self._tq_layer_idx, e)
                 # Fall through to SDPA path
 
@@ -651,8 +799,11 @@ def apply_tq_hooks() -> bool:
     TritonAttentionImpl.forward = _make_tq_forward(_original_forward)
     _hooks_applied = True
 
+    # Register custom op for zero-graph-break decode (CUDA-graphable)
+    _register_custom_ops()
+
     debug_status = "ENABLED" if _TQ_DEBUG else "disabled"
+    op_status = "custom_op (CUDA-graphable)" if _USE_CUSTOM_OP else "graph-break fallback"
     logger.info("TQ hooks applied to TritonAttentionImpl.forward "
-                "(standard backend, torch.compile compatible, "
-                "debug %s)", debug_status)
+                "(%s, debug %s)", op_status, debug_status)
     return True
