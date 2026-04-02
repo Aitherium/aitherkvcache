@@ -11,5 +11,6 @@ Or register manually:
 """
 
 from .plugin import register
+from .hooks import apply_tq_hooks
 
-__all__ = ["register"]
+__all__ = ["register", "apply_tq_hooks"]

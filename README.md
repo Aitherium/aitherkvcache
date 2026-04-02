@@ -55,10 +55,27 @@ AITHER_TQ_EAGER=0             # 0 = torch.compile+CUDA graphs (recommended)
 AITHER_TQ_FORCE_TRITON=1      # Required on Blackwell (SM_100+)
 ```
 
-**Validated**: 64 tok/s decode on RTX 5090 (Blackwell SM_120), 138 tok/s at 10 concurrent.
+**Validated**: 224 tok/s decode at 5 concurrent on RTX 5090 (Blackwell SM_120), 288 tok/s peak at 10 concurrent.
+
+### Hook-based integration (v0.9.1+)
+
+For maximum performance with `torch.compile` + CUDA graphs, use the hook-based approach
+instead of the custom backend. This monkey-patches `TritonAttentionImpl.forward()` to
+intercept encode/decode without registering a custom backend (avoids Inductor corruption bugs):
 
 ```python
-# Or register manually in your own code:
+from turboquant.vllm.hooks import apply_tq_hooks
+
+# Call AFTER vLLM model is loaded:
+apply_tq_hooks()
+```
+
+The hook path merges encode + fused attention into a single `@torch.compiler.disable` call
+per layer, eliminating redundant graph breaks and CPU-GPU synchronization. Measured: **40 tok/s**
+single-request decode on RTX 5090, up from 11 tok/s with separate encode/decode calls.
+
+```python
+# Or register the plugin-based backend:
 from turboquant.vllm import register
 register()
 ```
