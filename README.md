@@ -42,9 +42,9 @@ via Python entry points. It provides:
 - **TurboQuantBackend**: registered as the `CUSTOM` attention backend
 - **TurboQuantImpl**: fused TQ decode (single-token) + standard Triton prefill (multi-token)
 - **TQGPUCache**: GPU-resident TQ-compressed KV storage with DDR5 cold tier (spill/warm)
-- **ColdTierCache**: Phase 1 fallback — async background GPU-to-CPU TQ encode
+- **ColdTierCache**: Phase 1 fallback -- async background GPU-to-CPU TQ encode
 
-Decode reads directly from TQ-compressed GPU storage — no decompression buffer.
+Decode reads directly from TQ-compressed GPU storage -- no decompression buffer.
 3.8x compression vs FP16 at 4-bit, up to 7.1x at 2-bit (1.9x vs FP8 at 4-bit).
 
 ```bash
@@ -55,7 +55,8 @@ AITHER_TQ_EAGER=0             # 0 = torch.compile+CUDA graphs (recommended)
 AITHER_TQ_FORCE_TRITON=1      # Required on Blackwell (SM_100+)
 ```
 
-**Validated**: 224 tok/s decode at 5 concurrent on RTX 5090 (Blackwell SM_120), 288 tok/s peak at 10 concurrent.
+**Validated**: RTX 5090 (Blackwell SM_120) -- 23.6 tok/s single-request, 120 tok/s 5x concurrent,
+27,541 KV blocks (3.8x vs FP8), 7/7 CUDA graphs captured. 174 unit tests + 38 integration tests.
 
 ### Hook-based integration (v0.9.1+)
 
@@ -79,6 +80,64 @@ single-request decode on RTX 5090, up from 11 tok/s with separate encode/decode 
 from turboquant.vllm import register
 register()
 ```
+
+### Hybrid modes (tq35/tq25) -- v1.0+
+
+Split-group quantization with QJL residual encoding. Better quality at the same
+compression ratio as uniform TQ:
+
+```python
+from turboquant import HybridTurboQuant
+
+htq = HybridTurboQuant(head_dim=128, mode="tq35", device="cuda")
+htq.calibrate_uniform()
+packed = htq.encode(kv_vectors)   # single tensor, norms embedded
+decoded = htq.decode(packed)
+```
+
+| Mode | Avg Bits | Strategy |
+|------|----------|----------|
+| tq35 | 3.5 | 50% dims @ 4-bit + 50% @ 3-bit (MSE + QJL) |
+| tq25 | 2.5 | 25% dims @ 3-bit + 75% @ 2-bit (MSE + QJL) |
+
+### PRIMARY mode -- TQ IS the KV cache
+
+Instead of maintaining a shadow copy, PRIMARY mode patches vLLM to allocate
+TQ-compressed blocks directly. 3.8x more blocks for the same VRAM budget:
+
+```bash
+export AITHER_TQ_MODE=tq4-primary
+export AITHER_TQ_BITS=4
+```
+
+Requires engine patches + hook-based integration:
+
+```python
+from turboquant.vllm.engine import apply_tq_patches
+from turboquant.vllm.hooks import apply_tq_hooks
+
+apply_tq_patches(bits=4)  # Before vLLM starts
+apply_tq_hooks()           # After model loads
+```
+
+Or use the provided sitecustomize hook for automatic patching:
+
+```bash
+cp $(python -c "from turboquant.vllm import sitecustomize; print(sitecustomize.__file__)") /path/to/sitecustomize.py
+export PYTHONPATH="/path/to:$PYTHONPATH"
+vllm serve your-model --attention-backend TRITON_ATTN --compilation-config '{"cudagraph_mode":"piecewise"}'
+```
+
+### Zero graph breaks -- full CUDA graph support (v1.0+)
+
+All modes now register `torch.library.custom_op` for zero-graph-break decode:
+
+| Mode | Custom Op | Decode Strategy |
+|------|-----------|----------------|
+| tq4/tq3/tq2 | `tq::decode_step` | Fused rotated-domain Triton attention |
+| tq35/tq25 | `tq::hybrid_decode_step` | Clamp-gather decompress + masked SDPA |
+
+Requires PyTorch 2.4+. Falls back to `@torch.compiler.disable` graph breaks on older PyTorch.
 
 ## Where This Fits
 
@@ -180,6 +239,18 @@ class TurboQuant:
     def benchmark(self, num_vectors=32768) -> dict
     def compression_ratio(self) -> float
     def memory_report(self, seq_len, num_layers=32, num_kv_heads=8) -> dict
+
+class HybridTurboQuant:
+    def __init__(self, head_dim=128, mode="tq35", seed=42, device="cuda")
+    def calibrate_uniform(self, num_kv_heads=1)
+    def calibrate(self, sample_vectors: Tensor)
+    def encode(self, x: Tensor) -> Tensor           # packed only (norms embedded)
+    def decode(self, packed: Tensor) -> Tensor
+    def validate(self, num_vectors=10000) -> dict
+    def compression_ratio(self) -> float
+
+    @staticmethod
+    def packed_dim_for_mode(head_dim: int, mode: str) -> int
 
 class TQPagedAttention:
     def __init__(self, tq: TurboQuant, num_query_heads: int)

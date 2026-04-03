@@ -11,15 +11,15 @@ Architecture:
   - TQ hooks intercept forward() to encode/decode KV cache transparently
   - Decode: merged encode+fused attention in ONE graph break per layer
     (halves Python overhead vs separate encode + decode calls)
-  - Prefill: decompress TQ blocks → temp fp8 buffer → standard attention
+  - Prefill: decompress TQ blocks -> temp fp8 buffer -> standard attention
   - @torch.compiler.disable on encode/decompress creates clean graph breaks
   - The attention kernel itself remains compiled + CUDA-graphable
 
 Apply hooks AFTER vLLM engine init (model loaded, layers instantiated):
-    from lib.gpu.turboquant.vllm_hooks import apply_tq_hooks
+    from turboquant.vllm.hooks import apply_tq_hooks
     apply_tq_hooks()
 
-Requires: vllm_engine.apply_tq_patches() already applied (page_size, reshape).
+Requires: turboquant.vllm.engine.apply_tq_patches() already applied (page_size, reshape).
 
 Debug logging: set AITHER_TQ_DEBUG=1 to enable detailed per-step diagnostics.
 Set AITHER_TQ_DEBUG_STEPS=N to log the first N forward calls per layer-0
@@ -34,9 +34,19 @@ from typing import ClassVar, Optional
 
 import torch
 
-logger = logging.getLogger("aither.turboquant.hooks")
+logger = logging.getLogger("turboquant.hooks")
 
-# ── Debug logger ──────────────────────────────────────────────────
+# -- Mode detection -------------------------------------------------------
+# Derive TQ mode at import time. Hooks support both uniform (tq2/3/4)
+# and hybrid (tq35/tq25) quantizers. The main difference:
+#   uniform: encode -> (packed, norms), separate norm tensors, fused Triton decode
+#   hybrid:  encode -> packed (norms embedded), decompress+SDPA for decode
+
+_TQ_MODE = os.environ.get("AITHER_TQ_MODE", "").replace("-primary", "")
+_TQ_BITS = int(os.environ.get("AITHER_TQ_BITS", "4"))
+_TQ_IS_HYBRID = _TQ_MODE in ("tq35", "tq25")
+
+# -- Debug logger ----------------------------------------------------------
 # Controlled by AITHER_TQ_DEBUG=1. Prints to stderr so it shows in
 # `docker logs` without buffering issues.
 
@@ -68,15 +78,16 @@ class _TQStats:
 _stats = _TQStats()
 
 
-# ── Module-level state ──────────────────────────────────────────────
+# -- Module-level state ----------------------------------------------------
 
 _hooks_applied = False
 _original_forward = None  # Saved reference to TritonAttentionImpl.forward
 
 # TQ state shared across all layers (class-level in the patched impl)
 _tq_quantizer: Optional[object] = None
-_tq_fused_attn: dict = {}  # layer_idx → TQPagedAttention instance
-_primary_k_norms: Optional[torch.Tensor] = None
+_tq_packed_dim: int = 0     # packed bytes per head (derived from quantizer)
+_tq_fused_attn: dict = {}   # layer_idx -> TQPagedAttention instance
+_primary_k_norms: Optional[torch.Tensor] = None  # None for hybrid (norms embedded)
 _primary_v_norms: Optional[torch.Tensor] = None
 _layer_counter = 0
 _num_layers = 0
@@ -86,15 +97,15 @@ _prefill_k_buf: Optional[torch.Tensor] = None
 _prefill_v_buf: Optional[torch.Tensor] = None
 _PREFILL_BUF_BLOCKS = 512
 
-# Custom op flag — set by _register_custom_ops()
+# Custom op flag -- set by _register_custom_ops()
 _USE_CUSTOM_OP = False
 
 
-# ── Custom op: zero graph breaks, CUDA-graphable ────────────────────
+# -- Custom op: zero graph breaks, CUDA-graphable -------------------------
 
 def _register_custom_ops():
     """Register TQ decode as a torch custom op (PyTorch 2.4+).
-    Eliminates ALL graph breaks from decode — enables CUDA graph capture."""
+    Eliminates ALL graph breaks from decode -- enables CUDA graph capture."""
     global _USE_CUSTOM_OP
 
     if not hasattr(torch.library, "custom_op"):
@@ -125,7 +136,7 @@ def _register_custom_ops():
             num_actual: int,
         ) -> torch.Tensor:
             """Encode new token + fused TQ attention. No graph break.
-            Accesses module globals (_tq_quantizer, _tq_fused_attn) in body —
+            Accesses module globals (_tq_quantizer, _tq_fused_attn) in body --
             these are initialized during vLLM warmup before CUDA graph capture."""
             tq = _tq_quantizer
             packed_dim = head_size // 2
@@ -133,7 +144,7 @@ def _register_custom_ops():
             value_cache = kv_cache[:, 1]
             block_size = key_cache.shape[1]
 
-            # Encode — branchless, no CPU-GPU sync
+            # Encode -- branchless, no CPU-GPU sync
             bi = slot_mapping // block_size
             oi = slot_mapping % block_size
             N, H, D = key.shape
@@ -156,7 +167,7 @@ def _register_custom_ops():
             # Fused attention (lazy-init persists across CUDA graph replay)
             fused = _tq_fused_attn.get(layer_idx)
             if fused is None:
-                from .fused_attention import TQPagedAttention
+                from ..fused_attention import TQPagedAttention
                 fused = TQPagedAttention(tq, num_heads)
                 _tq_fused_attn[layer_idx] = fused
 
@@ -186,12 +197,163 @@ def _register_custom_ops():
         logger.info("TQ custom op registered: tq::decode_step "
                      "(zero graph breaks, CUDA-graphable)")
     except Exception as e:
-        logger.warning("TQ custom op registration failed: %s — "
+        logger.warning("TQ custom op registration failed: %s -- "
                        "using graph-break fallback", e)
         _USE_CUSTOM_OP = False
 
 
-# ── Helpers (run eagerly, create graph breaks) ──────────────────────
+# -- Hybrid custom op: zero graph breaks for tq35/tq25 --------------------
+# Strategy: clamp-gather decompress -> masked batched SDPA.
+# All fixed-size tensor ops. Fully CUDA-graphable.
+
+_USE_HYBRID_CUSTOM_OP = False
+
+# Pre-allocated decompress buffers (avoid per-step VRAM allocation)
+_hybrid_dk_buf: Optional[torch.Tensor] = None
+_hybrid_dv_buf: Optional[torch.Tensor] = None
+
+
+def _register_hybrid_custom_ops():
+    """Register hybrid TQ decode as a torch custom op (PyTorch 2.4+).
+    Zero graph breaks -- CUDA-graphable hybrid decode."""
+    global _USE_HYBRID_CUSTOM_OP
+
+    if not hasattr(torch.library, "custom_op"):
+        logger.info("TQ hybrid custom op: torch.library.custom_op not available "
+                     "(need PyTorch 2.4+), using graph-break fallback")
+        return
+
+    try:
+        import torch.nn.functional as F
+
+        @torch.library.custom_op("tq::hybrid_decode_step",
+                                  mutates_args=("kv_cache", "output"))
+        def _hybrid_decode_step_op(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            kv_cache: torch.Tensor,
+            output: torch.Tensor,
+            slot_mapping: torch.Tensor,
+            block_table: torch.Tensor,
+            seq_lens: torch.Tensor,
+            layer_idx: int,
+            num_heads: int,
+            num_kv_heads: int,
+            head_size: int,
+            scale: float,
+            num_actual: int,
+        ) -> torch.Tensor:
+            """Hybrid TQ: encode + clamp-gather decompress + masked SDPA.
+            Zero graph breaks. All fixed-size tensor ops.
+
+            Architecture:
+              1. Encode new K/V token into TQ cache (branchless index math)
+              2. Clamp block_table indices to [0, max) -- padding reads block 0
+              3. Batch decompress ALL referenced blocks in one tq.decode() call
+              4. Reshape to [num_seqs, max_ctx, kv_heads, head_dim]
+              5. Build attention mask from seq_lens (arange < seq_lens)
+              6. GQA expand + batched SDPA
+              7. Write output
+
+            No Python loops. No .item() / .any() CPU-GPU syncs.
+            CUDA graph captures the exact kernel launch sequence.
+            """
+            global _hybrid_dk_buf, _hybrid_dv_buf
+
+            tq = _tq_quantizer
+            packed_dim = _tq_packed_dim
+            key_cache = kv_cache[:, 0]
+            value_cache = kv_cache[:, 1]
+            block_size = key_cache.shape[1]
+
+            # -- 1. Encode new K/V into TQ cache (branchless) ------
+            bi = slot_mapping // block_size
+            oi = slot_mapping % block_size
+            N, H, D = key.shape
+
+            kp = tq.encode(key.reshape(N * H, D)).reshape(N, H, packed_dim)
+            vp = tq.encode(value.reshape(N * H, D)).reshape(N, H, packed_dim)
+
+            key_cache[bi, oi, :, :packed_dim] = kp
+            value_cache[bi, oi, :, :packed_dim] = vp
+
+            _stats.encode_calls += 1
+            _stats.encode_tokens += N
+
+            # -- 2. Clamp block indices (padding -> block 0, masked out) --
+            num_seqs = block_table.shape[0]
+            max_blocks_per_seq = block_table.shape[1]
+            max_ctx = max_blocks_per_seq * block_size
+            num_cache_blocks = key_cache.shape[0]
+
+            bt_clamped = block_table.clamp(min=0, max=num_cache_blocks - 1)
+            flat_bt = bt_clamped.reshape(-1)  # [num_seqs * max_blocks]
+
+            # -- 3. Batch decompress (one call, no loop) -----------
+            kp_gather = key_cache[flat_bt, :, :, :packed_dim]
+            vp_gather = value_cache[flat_bt, :, :, :packed_dim]
+            # Shape: [S*max_blocks, block_size, kv_heads, packed_dim]
+
+            total_slots = flat_bt.shape[0] * block_size * num_kv_heads
+            dk = tq.decode(kp_gather.reshape(total_slots, packed_dim))
+            dv = tq.decode(vp_gather.reshape(total_slots, packed_dim))
+            # Shape: [total_slots, head_dim]
+
+            dk = dk.reshape(num_seqs, max_ctx, num_kv_heads, head_size)
+            dv = dv.reshape(num_seqs, max_ctx, num_kv_heads, head_size)
+
+            # -- 4. Attention mask from seq_lens -------------------
+            positions = torch.arange(max_ctx, device=query.device, dtype=seq_lens.dtype)
+            # [max_ctx] < [num_seqs, 1] -> [num_seqs, max_ctx]
+            valid_mask = positions.unsqueeze(0) < seq_lens[:num_seqs].unsqueeze(1)
+            # Expand to [num_seqs, 1, 1, max_ctx] for SDPA broadcast
+            attn_mask = torch.where(
+                valid_mask.unsqueeze(1).unsqueeze(1),
+                torch.zeros(1, dtype=torch.bfloat16, device=query.device),
+                torch.tensor(float('-inf'), dtype=torch.bfloat16, device=query.device),
+            )
+
+            # -- 5. SDPA (batched, no loop) ------------------------
+            q = query[:num_actual].to(torch.bfloat16)
+            # [num_seqs, 1, num_heads, head_dim] -> [num_seqs, num_heads, 1, head_dim]
+            q = q.unsqueeze(1).transpose(1, 2)
+
+            k = dk.to(torch.bfloat16).transpose(1, 2)  # [S, kv_H, max_ctx, D]
+            v = dv.to(torch.bfloat16).transpose(1, 2)
+
+            # GQA expansion
+            gqa_ratio = num_heads // num_kv_heads
+            if gqa_ratio > 1:
+                k = k.repeat_interleave(gqa_ratio, dim=1)
+                v = v.repeat_interleave(gqa_ratio, dim=1)
+
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, scale=scale)
+            # [S, H, 1, D] -> [S, H, D]
+            output[:num_actual] = attn_out.squeeze(2).to(output.dtype)
+            return output
+
+        @_hybrid_decode_step_op.register_fake
+        def _hybrid_decode_step_fake(
+            query, key, value, kv_cache, output,
+            slot_mapping, block_table, seq_lens,
+            layer_idx, num_heads, num_kv_heads, head_size, scale,
+            num_actual,
+        ):
+            """Shape inference for torch.compile tracing."""
+            return output
+
+        _USE_HYBRID_CUSTOM_OP = True
+        logger.info("TQ hybrid custom op registered: tq::hybrid_decode_step "
+                     "(zero graph breaks, CUDA-graphable decompress+SDPA)")
+    except Exception as e:
+        logger.warning("TQ hybrid custom op registration failed: %s -- "
+                       "using graph-break fallback", e)
+        _USE_HYBRID_CUSTOM_OP = False
+
+
+# -- Helpers (run eagerly, create graph breaks) ----------------------------
 
 @torch.compiler.disable
 def _tq_init_layer(self_impl):
@@ -209,21 +371,40 @@ def _tq_init_layer(self_impl):
 @torch.compiler.disable
 def _ensure_quantizer(device, head_size, num_heads, num_kv_heads):
     """Lazy-init TQ quantizer and fused attention on first real forward."""
-    global _tq_quantizer, _num_layers
+    global _tq_quantizer, _tq_packed_dim, _num_layers
     if _tq_quantizer is not None:
         return
 
-    from .quantizer import TurboQuant
-    _tq_quantizer = TurboQuant(head_dim=head_size, bits=4, device=str(device))
     _num_layers = _layer_counter
-    logger.info("TQ quantizer initialized: head_dim=%d, bits=4, %d layers",
-                head_size, _num_layers)
+
+    if _TQ_IS_HYBRID:
+        from ..hybrid_quantizer import HybridTurboQuant
+        _tq_quantizer = HybridTurboQuant(
+            head_dim=head_size, mode=_TQ_MODE, device=str(device),
+            num_kv_heads=num_kv_heads)
+        _tq_quantizer.calibrate_uniform()
+        _tq_packed_dim = _tq_quantizer.layout.packed_dim
+        logger.info("TQ hybrid quantizer initialized: head_dim=%d, mode=%s, "
+                    "packed_dim=%d, %d layers",
+                    head_size, _TQ_MODE, _tq_packed_dim, _num_layers)
+    else:
+        from ..quantizer import TurboQuant
+        from ..packing import packed_size
+        _tq_quantizer = TurboQuant(
+            head_dim=head_size, bits=_TQ_BITS, device=str(device))
+        _tq_packed_dim = packed_size(head_size, _TQ_BITS)
+        logger.info("TQ quantizer initialized: head_dim=%d, bits=%d, "
+                    "packed_dim=%d, %d layers",
+                    head_size, _TQ_BITS, _tq_packed_dim, _num_layers)
 
 
 @torch.compiler.disable
 def _ensure_norms(num_layers, num_blocks, block_size, num_kv_heads, device):
-    """Lazy-init per-layer float32 norm tensors."""
+    """Lazy-init per-layer float32 norm tensors (uniform mode only).
+    Hybrid mode embeds norms in packed data -- no separate tensors needed."""
     global _primary_k_norms, _primary_v_norms
+    if _TQ_IS_HYBRID:
+        return  # Norms embedded in packed data
     if _primary_k_norms is not None:
         return
     _primary_k_norms = torch.zeros(
@@ -238,13 +419,14 @@ def _ensure_norms(num_layers, num_blocks, block_size, num_kv_heads, device):
 
 @torch.compiler.disable
 def _tq_encode_phase(layer_idx, key, value, kv_cache, slot_mapping):
-    """Encode new K,V tokens into TQ primary cache. Runs eagerly."""
+    """Encode new K,V tokens into TQ primary cache. Runs eagerly.
+    Supports both uniform (separate norms) and hybrid (norms embedded) modes."""
     global _tq_quantizer, _primary_k_norms, _primary_v_norms
     tq = _tq_quantizer
     if tq is None:
         return
 
-    packed_dim = key.shape[-1] // 2  # head_dim // 2 for 4-bit
+    packed_dim = _tq_packed_dim
 
     key_cache = kv_cache[:, 0]    # [blocks, block_size, kv_heads, tq_dim]
     value_cache = kv_cache[:, 1]
@@ -275,20 +457,29 @@ def _tq_encode_phase(layer_idx, key, value, kv_cache, slot_mapping):
     vv = value[valid][in_range].contiguous()
     N, H, D = vk.shape
 
-    # Encode: TQ returns packed indices [N*H, packed_dim] and norms [N*H]
-    kp, kn = tq.encode(vk.reshape(N * H, D))
-    vp, vn = tq.encode(vv.reshape(N * H, D))
+    if _TQ_IS_HYBRID:
+        # Hybrid: encode returns packed-only (norms embedded in packed data)
+        kp = tq.encode(vk.reshape(N * H, D))
+        vp = tq.encode(vv.reshape(N * H, D))
 
-    kp = kp.reshape(N, H, packed_dim)
-    vp = vp.reshape(N, H, packed_dim)
+        kp = kp.reshape(N, H, packed_dim)
+        vp = vp.reshape(N, H, packed_dim)
 
-    # Write packed indices to uint8 cache
-    key_cache[bi, oi, :, :packed_dim] = kp
-    value_cache[bi, oi, :, :packed_dim] = vp
+        key_cache[bi, oi, :, :packed_dim] = kp
+        value_cache[bi, oi, :, :packed_dim] = vp
+    else:
+        # Uniform: encode returns (packed, norms) separately
+        kp, kn = tq.encode(vk.reshape(N * H, D))
+        vp, vn = tq.encode(vv.reshape(N * H, D))
 
-    # Write norms to per-layer float32 tensors
-    _primary_k_norms[layer_idx, bi, oi] = kn.reshape(N, H).to(torch.float32)
-    _primary_v_norms[layer_idx, bi, oi] = vn.reshape(N, H).to(torch.float32)
+        kp = kp.reshape(N, H, packed_dim)
+        vp = vp.reshape(N, H, packed_dim)
+
+        key_cache[bi, oi, :, :packed_dim] = kp
+        value_cache[bi, oi, :, :packed_dim] = vp
+
+        _primary_k_norms[layer_idx, bi, oi] = kn.reshape(N, H).to(torch.float32)
+        _primary_v_norms[layer_idx, bi, oi] = vn.reshape(N, H).to(torch.float32)
 
     # Stats
     _stats.encode_calls += 1
@@ -297,9 +488,8 @@ def _tq_encode_phase(layer_idx, key, value, kv_cache, slot_mapping):
 
     if _TQ_DEBUG and _stats.encode_calls <= _TQ_DEBUG_STEPS:
         _dbg(f"ENCODE#{_stats.encode_calls} L{layer_idx}: N={N}, "
-             f"bi={bi[:min(4,len(bi))].tolist()}, "
-             f"kn=[{kn.min().item():.1f},{kn.max().item():.1f}], "
-             f"vn=[{vn.min().item():.3f},{vn.max().item():.3f}]")
+             f"mode={'hybrid' if _TQ_IS_HYBRID else 'uniform'}, "
+             f"bi={bi[:min(4,len(bi))].tolist()}")
 
 
 @torch.compiler.disable
@@ -348,16 +538,20 @@ def _tq_decompress_active(layer_idx, kv_cache, block_table, num_kv_heads,
 
         kp_all = key_cache[active_blocks, :, :, :packed_dim]
         vp_all = value_cache[active_blocks, :, :, :packed_dim]
-        kn_all = _primary_k_norms[layer_idx, active_blocks]
-        vn_all = _primary_v_norms[layer_idx, active_blocks]
 
         flat_kp = kp_all.reshape(A * block_size * H, packed_dim)
-        flat_kn = kn_all.reshape(A * block_size * H)
         flat_vp = vp_all.reshape(A * block_size * H, packed_dim)
-        flat_vn = vn_all.reshape(A * block_size * H)
 
-        decoded_k = tq.decode(flat_kp, flat_kn)
-        decoded_v = tq.decode(flat_vp, flat_vn)
+        if _TQ_IS_HYBRID:
+            decoded_k = tq.decode(flat_kp)
+            decoded_v = tq.decode(flat_vp)
+        else:
+            kn_all = _primary_k_norms[layer_idx, active_blocks]
+            vn_all = _primary_v_norms[layer_idx, active_blocks]
+            flat_kn = kn_all.reshape(A * block_size * H)
+            flat_vn = vn_all.reshape(A * block_size * H)
+            decoded_k = tq.decode(flat_kp, flat_kn)
+            decoded_v = tq.decode(flat_vp, flat_vn)
 
         k_buf[active_blocks] = decoded_k.reshape(A, block_size, H, -1).to(k_buf.dtype)
         v_buf[active_blocks] = decoded_v.reshape(A, block_size, H, -1).to(v_buf.dtype)
@@ -376,7 +570,7 @@ def _tq_fused_decode(layer_idx, query, kv_cache, attn_metadata, output,
 
     # Lazy-init fused attention for this layer
     if layer_idx not in _tq_fused_attn:
-        from .fused_attention import TQPagedAttention
+        from ..fused_attention import TQPagedAttention
         _tq_fused_attn[layer_idx] = TQPagedAttention(_tq_quantizer, num_heads)
 
     fused = _tq_fused_attn[layer_idx]
@@ -399,13 +593,14 @@ def _tq_fused_decode(layer_idx, query, kv_cache, attn_metadata, output,
     return output
 
 
-# ── Inline helpers (no decorator — called from within @torch.compiler.disable) ──
+# -- Inline helpers (no decorator -- called from within @torch.compiler.disable) --
 
 def _encode_inline(layer_idx, key, value, kv_cache, slot_mapping):
-    """Encode K/V into TQ cache. No decorator — called from _tq_decode_step.
-    Branchless for decode: no .any() CPU-GPU syncs. Works for any N tokens."""
+    """Encode K/V into TQ cache. No decorator -- called from _tq_decode_step.
+    Branchless for decode: no .any() CPU-GPU syncs. Works for any N tokens.
+    Supports both uniform and hybrid modes."""
     tq = _tq_quantizer
-    packed_dim = key.shape[-1] // 2
+    packed_dim = _tq_packed_dim
     key_cache = kv_cache[:, 0]
     value_cache = kv_cache[:, 1]
     block_size = key_cache.shape[1]
@@ -417,17 +612,27 @@ def _encode_inline(layer_idx, key, value, kv_cache, slot_mapping):
 
     N, H, D = key.shape
 
-    kp, kn = tq.encode(key.reshape(N * H, D))
-    vp, vn = tq.encode(value.reshape(N * H, D))
+    if _TQ_IS_HYBRID:
+        kp = tq.encode(key.reshape(N * H, D))
+        vp = tq.encode(value.reshape(N * H, D))
 
-    kp = kp.reshape(N, H, packed_dim)
-    vp = vp.reshape(N, H, packed_dim)
+        kp = kp.reshape(N, H, packed_dim)
+        vp = vp.reshape(N, H, packed_dim)
 
-    key_cache[bi, oi, :, :packed_dim] = kp
-    value_cache[bi, oi, :, :packed_dim] = vp
+        key_cache[bi, oi, :, :packed_dim] = kp
+        value_cache[bi, oi, :, :packed_dim] = vp
+    else:
+        kp, kn = tq.encode(key.reshape(N * H, D))
+        vp, vn = tq.encode(value.reshape(N * H, D))
 
-    _primary_k_norms[layer_idx, bi, oi] = kn.reshape(N, H).to(torch.float32)
-    _primary_v_norms[layer_idx, bi, oi] = vn.reshape(N, H).to(torch.float32)
+        kp = kp.reshape(N, H, packed_dim)
+        vp = vp.reshape(N, H, packed_dim)
+
+        key_cache[bi, oi, :, :packed_dim] = kp
+        value_cache[bi, oi, :, :packed_dim] = vp
+
+        _primary_k_norms[layer_idx, bi, oi] = kn.reshape(N, H).to(torch.float32)
+        _primary_v_norms[layer_idx, bi, oi] = vn.reshape(N, H).to(torch.float32)
 
     _stats.encode_calls += 1
     _stats.encode_tokens += N
@@ -443,18 +648,19 @@ def _tq_decode_step(layer_idx, query, key, value, kv_cache, attn_metadata,
         _encode_inline(layer_idx, key, value, kv_cache,
                        attn_metadata.slot_mapping)
 
-    # Fused attention — dict lookup for cached TQPagedAttention
+    # Fused attention -- dict lookup for cached TQPagedAttention
     fused = _tq_fused_attn.get(layer_idx)
     if fused is None:
-        from .fused_attention import TQPagedAttention
+        from ..fused_attention import TQPagedAttention
         fused = TQPagedAttention(_tq_quantizer, num_heads)
         _tq_fused_attn[layer_idx] = fused
 
-    packed_dim = head_size // 2
+    packed_dim = _tq_packed_dim
     key_cache = kv_cache[:, 0]
     value_cache = kv_cache[:, 1]
 
     num_actual = attn_metadata.num_actual_tokens
+
     fused_out = fused.forward(
         query=query[:num_actual],
         k_packed=key_cache[:, :, :, :packed_dim],
@@ -468,7 +674,7 @@ def _tq_decode_step(layer_idx, query, key, value, kv_cache, attn_metadata,
     return output
 
 
-# ── Prefill scatter-write (for writing raw K/V into decompress buffer) ──
+# -- Prefill scatter-write (for writing raw K/V into decompress buffer) --
 
 @torch.compiler.disable
 def _prefill_scatter_write(key, value, k_cache, v_cache, slot_mapping, block_size):
@@ -497,7 +703,7 @@ def _tq_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
                      output, num_heads, num_kv_heads, head_size, scale):
     """Prefill/decode using torch SDPA with raw K/V + decompressed prior context.
     Manual GQA expansion. is_causal=True for prefill, is_causal=False for decode
-    (single query attends to all prior positions — no mask needed)."""
+    (single query attends to all prior positions -- no mask needed)."""
     import torch.nn.functional as F
     global _tq_quantizer, _primary_k_norms, _primary_v_norms
 
@@ -513,7 +719,7 @@ def _tq_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
     key_cache = kv_cache[:, 0]
     value_cache = kv_cache[:, 1]
     block_size = key_cache.shape[1]
-    packed_dim = head_size // 2
+    packed_dim = _tq_packed_dim
     block_table = attn_metadata.block_table
 
     for i in range(num_seqs):
@@ -543,11 +749,18 @@ def _tq_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
 
                 kp = key_cache[bt, :, :, :packed_dim]
                 vp = value_cache[bt, :, :, :packed_dim]
-                kn = _primary_k_norms[layer_idx, bt]
-                vn = _primary_v_norms[layer_idx, bt]
 
-                dk = tq.decode(kp.reshape(-1, packed_dim), kn.reshape(-1))
-                dv = tq.decode(vp.reshape(-1, packed_dim), vn.reshape(-1))
+                flat_kp = kp.reshape(-1, packed_dim)
+                flat_vp = vp.reshape(-1, packed_dim)
+
+                if _TQ_IS_HYBRID:
+                    dk = tq.decode(flat_kp)
+                    dv = tq.decode(flat_vp)
+                else:
+                    kn = _primary_k_norms[layer_idx, bt]
+                    vn = _primary_v_norms[layer_idx, bt]
+                    dk = tq.decode(flat_kp, kn.reshape(-1))
+                    dv = tq.decode(flat_vp, vn.reshape(-1))
 
                 dk = dk.reshape(-1, H, head_size).to(torch.bfloat16)[:prior_len]
                 dv = dv.reshape(-1, H, head_size).to(torch.bfloat16)[:prior_len]
@@ -574,7 +787,7 @@ def _tq_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
             vi_4d = vi_4d.repeat_interleave(gqa_ratio, dim=1)
 
         # Prefill (q_len == kv_len): is_causal=True for standard causal mask.
-        # Decode (q_len < kv_len): is_causal=False — single query row attends
+        # Decode (q_len < kv_len): is_causal=False -- single query row attends
         # to all KV positions (no future tokens exist to mask out).
         # NOTE: is_causal=True with q_len < kv_len is documented to work in
         # PyTorch 2.2+ but produces degenerate (constant) output on some
@@ -589,44 +802,57 @@ def _tq_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
     return output
 
 
-# ── Main hook: patched forward ──────────────────────────────────────
+# -- Main hook: patched forward --------------------------------------------
 
 def _make_tq_forward(original_fwd):
     """Create the TQ-hooked forward that wraps standard TritonAttention."""
 
     def tq_forward(self, layer, query, key, value, kv_cache, attn_metadata,
                    output=None, output_scale=None, output_block_scale=None):
-        # ═══ FAST PATH: decode via custom op (Dynamo-traceable, CUDA-graphable) ═══
+        # === FAST PATH: decode via custom op (Dynamo-traceable, CUDA-graphable) ===
         # No try/except, no init, no graph breaks. Dynamo can trace straight through.
         # Runs during BOTH normal execution AND CUDA graph capture.
         # Falls through to slow path for: init, prefill, missing key/value.
-        if (_USE_CUSTOM_OP
-                and hasattr(self, '_tq_layer_idx')
+        if (hasattr(self, '_tq_layer_idx')
                 and _tq_quantizer is not None
-                and _primary_k_norms is not None
                 and attn_metadata is not None
                 and output is not None
                 and key is not None and value is not None
                 and hasattr(attn_metadata, 'max_query_len')
                 and attn_metadata.max_query_len == 1):
             num_actual = attn_metadata.num_actual_tokens
-            return torch.ops.tq.decode_step(
-                query, key[:num_actual], value[:num_actual],
-                kv_cache, output,
-                _primary_k_norms, _primary_v_norms,
-                attn_metadata.slot_mapping,
-                attn_metadata.block_table,
-                attn_metadata.seq_lens,
-                self._tq_layer_idx,
-                self.num_heads, self.num_kv_heads,
-                self.head_size, self.scale, num_actual)
 
-        # ═══ SLOW PATH: init, prefill, fallback ═══
+            # Hybrid custom op: clamp-gather decompress + masked SDPA
+            if _USE_HYBRID_CUSTOM_OP and _TQ_IS_HYBRID:
+                return torch.ops.tq.hybrid_decode_step(
+                    query, key[:num_actual], value[:num_actual],
+                    kv_cache, output,
+                    attn_metadata.slot_mapping,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    self._tq_layer_idx,
+                    self.num_heads, self.num_kv_heads,
+                    self.head_size, self.scale, num_actual)
+
+            # Uniform custom op: fused rotated-domain attention
+            if _USE_CUSTOM_OP and not _TQ_IS_HYBRID and _primary_k_norms is not None:
+                return torch.ops.tq.decode_step(
+                    query, key[:num_actual], value[:num_actual],
+                    kv_cache, output,
+                    _primary_k_norms, _primary_v_norms,
+                    attn_metadata.slot_mapping,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    self._tq_layer_idx,
+                    self.num_heads, self.num_kv_heads,
+                    self.head_size, self.scale, num_actual)
+
+        # === SLOW PATH: init, prefill, fallback ===
         # --- Layer init (once per instance, guarded to avoid graph break) ---
         if not hasattr(self, '_tq_layer_idx'):
             _tq_init_layer(self)
 
-        # --- CUDA graph capture bypass (slow path only — fast path handles capture) ---
+        # --- CUDA graph capture bypass (slow path only -- fast path handles capture) ---
         if attn_metadata is None or torch.cuda.is_current_stream_capturing():
             if output is not None:
                 output.fill_(0)
@@ -640,7 +866,7 @@ def _make_tq_forward(original_fwd):
         if _tq_quantizer is None:
             _ensure_quantizer(query.device, self.head_size,
                              self.num_heads, self.num_kv_heads)
-        if _primary_k_norms is None:
+        if not _TQ_IS_HYBRID and _primary_k_norms is None:
             num_blocks = kv_cache.shape[0]
             block_size = kv_cache.shape[2]
             _ensure_norms(_layer_counter, num_blocks, block_size,
@@ -688,8 +914,29 @@ def _make_tq_forward(original_fwd):
                      f"enc_tok={_stats.encode_tokens}, "
                      f"blocks={sorted(_stats.encode_blocks)}")
 
-        # --- Phase 2a: Decode (custom op = zero graph breaks, or fallback) ---
-        if is_decode and _tq_quantizer is not None:
+        # --- Phase 2a: Decode (fused TQ attention for uniform, custom op for hybrid) ---
+        # Hybrid mode uses tq::hybrid_decode_step custom op (zero graph breaks),
+        # or falls through to encode+SDPA path if custom op not available.
+        if is_decode and _tq_quantizer is not None and _TQ_IS_HYBRID:
+            if _USE_HYBRID_CUSTOM_OP and key is not None and value is not None:
+                num_actual = attn_metadata.num_actual_tokens
+                try:
+                    result = torch.ops.tq.hybrid_decode_step(
+                        query, key[:num_actual], value[:num_actual],
+                        kv_cache, output,
+                        attn_metadata.slot_mapping,
+                        attn_metadata.block_table,
+                        attn_metadata.seq_lens,
+                        self._tq_layer_idx,
+                        self.num_heads, self.num_kv_heads,
+                        self.head_size, self.scale, num_actual)
+                    return result
+                except Exception as e:
+                    logger.error("TQ hybrid decode error L%d: %s",
+                                 self._tq_layer_idx, e)
+                    # Fall through to graph-break SDPA
+
+        if is_decode and _tq_quantizer is not None and not _TQ_IS_HYBRID:
             num_actual = attn_metadata.num_actual_tokens
             try:
                 if _TQ_DEBUG and self._tq_layer_idx == 0:
@@ -700,7 +947,7 @@ def _make_tq_forward(original_fwd):
 
                 if (_USE_CUSTOM_OP and key is not None and value is not None
                         and _primary_k_norms is not None):
-                    # Zero graph breaks — CUDA-graphable
+                    # Zero graph breaks -- CUDA-graphable
                     result = torch.ops.tq.decode_step(
                         query,
                         key[:num_actual], value[:num_actual],
@@ -773,14 +1020,14 @@ def _make_tq_forward(original_fwd):
     return tq_forward
 
 
-# ── Public API ──────────────────────────────────────────────────────
+# -- Public API ------------------------------------------------------------
 
 def apply_tq_hooks() -> bool:
     """
     Monkey-patch TritonAttentionImpl.forward with TQ encode/decode hooks.
     Call AFTER vLLM model is loaded (layers instantiated).
 
-    Does NOT register a custom attention backend — uses standard Triton.
+    Does NOT register a custom attention backend -- uses standard Triton.
     torch.compile + piecewise CUDA graphs work normally.
     """
     global _hooks_applied, _original_forward
@@ -792,18 +1039,28 @@ def apply_tq_hooks() -> bool:
     try:
         from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
     except ImportError:
-        logger.warning("TritonAttentionImpl not found — vLLM v0.15.1+ required")
+        logger.warning("TritonAttentionImpl not found -- vLLM v0.15.1+ required")
         return False
 
     _original_forward = TritonAttentionImpl.forward
     TritonAttentionImpl.forward = _make_tq_forward(_original_forward)
     _hooks_applied = True
 
-    # Register custom op for zero-graph-break decode (CUDA-graphable)
-    _register_custom_ops()
+    # Register custom ops for zero-graph-break decode
+    if _TQ_IS_HYBRID:
+        _register_hybrid_custom_ops()
+    else:
+        _register_custom_ops()
 
     debug_status = "ENABLED" if _TQ_DEBUG else "disabled"
-    op_status = "custom_op (CUDA-graphable)" if _USE_CUSTOM_OP else "graph-break fallback"
+    if _TQ_IS_HYBRID and _USE_HYBRID_CUSTOM_OP:
+        op_status = f"hybrid {_TQ_MODE} custom_op (CUDA-graphable decompress+SDPA)"
+    elif _TQ_IS_HYBRID:
+        op_status = f"hybrid {_TQ_MODE} (graph-break fallback)"
+    elif _USE_CUSTOM_OP:
+        op_status = "custom_op (CUDA-graphable fused rotated-domain)"
+    else:
+        op_status = "graph-break fallback"
     logger.info("TQ hooks applied to TritonAttentionImpl.forward "
                 "(%s, debug %s)", op_status, debug_status)
     return True

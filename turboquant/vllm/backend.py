@@ -728,6 +728,15 @@ def _make_impl_class():
             """
             packed_dim = self.head_size // 2  # 64 for head_dim=128 at 4-bit
 
+            # --- torch.compile argument swap workaround ---
+            # Inductor may swap query/value positions for GQA models.
+            # Detect by head count: query should have num_heads, value num_kv_heads.
+            if (query is not None and value is not None
+                    and query.dim() == 3 and value.dim() == 3
+                    and query.shape[1] == self.num_kv_heads
+                    and value.shape[1] == self.num_heads):
+                query, value = value, query
+
             # --- Allocate separate float32 norm tensors (once, per-layer) ---
             key_cache = kv_cache[:, 0]    # [blocks, block_size, heads, tq_dim]
             value_cache = kv_cache[:, 1]
