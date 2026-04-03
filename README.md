@@ -19,7 +19,7 @@ pip install aither-kvcache[all]       # everything
 ## Quick Start
 
 ```python
-from turboquant import TurboQuant
+from aither_kvcache import TurboQuant
 
 tq = TurboQuant(head_dim=128, bits=4, device="cuda")
 
@@ -65,7 +65,7 @@ instead of the custom backend. This monkey-patches `TritonAttentionImpl.forward(
 intercept encode/decode without registering a custom backend (avoids Inductor corruption bugs):
 
 ```python
-from turboquant.vllm.hooks import apply_tq_hooks
+from aither_kvcache.vllm.hooks import apply_tq_hooks
 
 # Call AFTER vLLM model is loaded:
 apply_tq_hooks()
@@ -77,7 +77,7 @@ single-request decode on RTX 5090, up from 11 tok/s with separate encode/decode 
 
 ```python
 # Or register the plugin-based backend:
-from turboquant.vllm import register
+from aither_kvcache.vllm import register
 register()
 ```
 
@@ -87,7 +87,7 @@ Split-group quantization with QJL residual encoding. Better quality at the same
 compression ratio as uniform TQ:
 
 ```python
-from turboquant import HybridTurboQuant
+from aither_kvcache import HybridTurboQuant
 
 htq = HybridTurboQuant(head_dim=128, mode="tq35", device="cuda")
 htq.calibrate_uniform()
@@ -113,8 +113,8 @@ export AITHER_TQ_BITS=4
 Requires engine patches + hook-based integration:
 
 ```python
-from turboquant.vllm.engine import apply_tq_patches
-from turboquant.vllm.hooks import apply_tq_hooks
+from aither_kvcache.vllm.engine import apply_tq_patches
+from aither_kvcache.vllm.hooks import apply_tq_hooks
 
 apply_tq_patches(bits=4)  # Before vLLM starts
 apply_tq_hooks()           # After model loads
@@ -123,7 +123,7 @@ apply_tq_hooks()           # After model loads
 Or use the provided sitecustomize hook for automatic patching:
 
 ```bash
-cp $(python -c "from turboquant.vllm import sitecustomize; print(sitecustomize.__file__)") /path/to/sitecustomize.py
+cp $(python -c "from aither_kvcache.vllm import sitecustomize; print(sitecustomize.__file__)") /path/to/sitecustomize.py
 export PYTHONPATH="/path/to:$PYTHONPATH"
 vllm serve your-model --attention-backend TRITON_ATTN --compilation-config '{"cudagraph_mode":"piecewise"}'
 ```
@@ -146,7 +146,7 @@ Requires PyTorch 2.4+. Falls back to `@torch.compiler.disable` graph breaks on o
 If you manage your own KV cache, drop `encode()` where you write and `decode()` where you read:
 
 ```python
-from turboquant import TurboQuant
+from aither_kvcache import TurboQuant
 
 tq = TurboQuant(head_dim=128, bits=4, device="cuda")
 
@@ -173,7 +173,7 @@ restored = tq.decode(packed, norms)        # [16, 8, 128]
 Compute attention directly from compressed data without ever decompressing:
 
 ```python
-from turboquant.fused_attention import TQPagedAttention
+from aither_kvcache.fused_attention import TQPagedAttention
 
 attn = TQPagedAttention(tq, num_query_heads=32)
 output = attn.forward(
@@ -267,7 +267,7 @@ physical KV cache blocks so eviction decisions understand what the blocks actual
 ### Quick Start
 
 ```python
-from turboquant import KVCacheGraph, GraphEvictionAdvisor, EdgeType
+from aither_kvcache import KVCacheGraph, GraphEvictionAdvisor, EdgeType
 
 # 1. Create the graph — protect system prompt blocks from eviction
 graph = KVCacheGraph(protected_sources={"system", "tools"})
@@ -298,7 +298,7 @@ prefetch = graph.suggest_prefetch(active_block_idxs=[0, 1, 2])
 For hot inference loops where you can't afford graph queries on the decode path:
 
 ```python
-from turboquant import GraphEvictionAdvisor
+from aither_kvcache import GraphEvictionAdvisor
 
 advisor = GraphEvictionAdvisor(graph, interval=0.5, max_stale=2.0)
 advisor.start()  # background thread recomputes rankings every 0.5s

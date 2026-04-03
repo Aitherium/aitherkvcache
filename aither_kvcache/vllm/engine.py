@@ -25,7 +25,7 @@ Two operating modes:
     This doubles usable context from ~280K to ~548K tokens.
 
 Apply patches BEFORE starting the vLLM server:
-    from turboquant.vllm.engine import apply_tq_patches
+    from aither_kvcache.vllm.engine import apply_tq_patches
     apply_tq_patches(bits=4)
 """
 

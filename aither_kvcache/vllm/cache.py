@@ -36,8 +36,8 @@ class TQGPUCache:
     def __init__(self, num_layers: int, max_blocks: int, block_size: int,
                  num_kv_heads: int, head_dim: int, bits: int = 4,
                  device: str = "cuda"):
-        from turboquant.quantizer import TurboQuant
-        from turboquant.packing import packed_size
+        from aither_kvcache.quantizer import TurboQuant
+        from aither_kvcache.packing import packed_size
 
         self.tq = TurboQuant(head_dim=head_dim, bits=bits, device=device)
         self.num_layers = num_layers
@@ -205,7 +205,7 @@ class ColdTierCache:
 
     def __init__(self, head_dim: int, num_kv_heads: int, bits: int = 4,
                  max_blocks: int = 2048, block_size: int = 16):
-        from turboquant import TurboQuant
+        from aither_kvcache import TurboQuant
 
         self.tq = TurboQuant(head_dim=head_dim, bits=bits, device="cpu")
         self.head_dim = head_dim

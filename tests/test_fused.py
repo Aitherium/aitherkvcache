@@ -12,11 +12,11 @@ import math
 import pytest
 import torch
 
-from turboquant.quantizer import TurboQuant, TurboQuantConfig
-from turboquant.rotation import random_orthogonal
-from turboquant.codebook import get_codebook
-from turboquant.packing import pack_4bit, unpack_4bit
-from turboquant.fused_attention import TQPagedAttentionRef, TQPagedAttention
+from aither_kvcache.quantizer import TurboQuant, TurboQuantConfig
+from aither_kvcache.rotation import random_orthogonal
+from aither_kvcache.codebook import get_codebook
+from aither_kvcache.packing import pack_4bit, unpack_4bit
+from aither_kvcache.fused_attention import TQPagedAttentionRef, TQPagedAttention
 
 DEVICE = "cpu"
 HEAD_DIM = 128

@@ -9,8 +9,8 @@ contention on the decode path.
 Standalone — no AitherOS dependencies. Requires turboquant.kvcache_graph.
 
 Usage:
-    from turboquant.kvcache_graph import KVCacheGraph
-    from turboquant.eviction_advisor import GraphEvictionAdvisor
+    from aither_kvcache.kvcache_graph import KVCacheGraph
+    from aither_kvcache.eviction_advisor import GraphEvictionAdvisor
 
     graph = KVCacheGraph(protected_sources={"system"})
     advisor = GraphEvictionAdvisor(graph)
@@ -32,7 +32,7 @@ from typing import Dict, List, Optional
 
 from .kvcache_graph import KVCacheGraph
 
-logger = logging.getLogger("turboquant.eviction_advisor")
+logger = logging.getLogger("aither_kvcache.eviction_advisor")
 
 
 class GraphEvictionAdvisor:

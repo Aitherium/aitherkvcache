@@ -16,7 +16,7 @@ Architecture:
   - The attention kernel itself remains compiled + CUDA-graphable
 
 Apply hooks AFTER vLLM engine init (model loaded, layers instantiated):
-    from turboquant.vllm.hooks import apply_tq_hooks
+    from aither_kvcache.vllm.hooks import apply_tq_hooks
     apply_tq_hooks()
 
 Requires: turboquant.vllm.engine.apply_tq_patches() already applied (page_size, reshape).

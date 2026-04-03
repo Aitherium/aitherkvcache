@@ -3,8 +3,8 @@ import time
 
 import pytest
 
-from turboquant.kvcache_graph import KVCacheGraph, EdgeType, get_kvcache_graph
-from turboquant.eviction_advisor import GraphEvictionAdvisor, reorder_by_ranking
+from aither_kvcache.kvcache_graph import KVCacheGraph, EdgeType, get_kvcache_graph
+from aither_kvcache.eviction_advisor import GraphEvictionAdvisor, reorder_by_ranking
 
 
 @pytest.fixture

@@ -25,13 +25,13 @@ NUM_BLOCKS = 64
 
 @pytest.fixture
 def uniform_tq():
-    from turboquant.quantizer import TurboQuant
+    from aither_kvcache.quantizer import TurboQuant
     return TurboQuant(head_dim=HEAD_DIM, bits=4, device="cpu")
 
 
 @pytest.fixture
 def hybrid_tq35():
-    from turboquant.hybrid_quantizer import HybridTurboQuant
+    from aither_kvcache.hybrid_quantizer import HybridTurboQuant
     htq = HybridTurboQuant(head_dim=HEAD_DIM, mode="tq35", device="cpu")
     htq.calibrate_uniform(num_kv_heads=NUM_KV_HEADS)
     return htq
@@ -39,7 +39,7 @@ def hybrid_tq35():
 
 @pytest.fixture
 def hybrid_tq25():
-    from turboquant.hybrid_quantizer import HybridTurboQuant
+    from aither_kvcache.hybrid_quantizer import HybridTurboQuant
     htq = HybridTurboQuant(head_dim=HEAD_DIM, mode="tq25", device="cpu")
     htq.calibrate_uniform(num_kv_heads=NUM_KV_HEADS)
     return htq
@@ -392,25 +392,25 @@ class TestPackedDimConsistency:
     """Verify packed_dim calculations are consistent across modules."""
 
     def test_packed_dim_for_mode_tq35(self):
-        from turboquant.hybrid_quantizer import HybridTurboQuant
+        from aither_kvcache.hybrid_quantizer import HybridTurboQuant
         pd = HybridTurboQuant.packed_dim_for_mode(HEAD_DIM, "tq35")
         assert pd > 0
         assert pd < HEAD_DIM  # should be compressed
 
     def test_packed_dim_for_mode_tq25(self):
-        from turboquant.hybrid_quantizer import HybridTurboQuant
+        from aither_kvcache.hybrid_quantizer import HybridTurboQuant
         pd = HybridTurboQuant.packed_dim_for_mode(HEAD_DIM, "tq25")
         assert pd > 0
         assert pd < HEAD_DIM
 
     def test_tq25_smaller_than_tq35(self):
-        from turboquant.hybrid_quantizer import HybridTurboQuant
+        from aither_kvcache.hybrid_quantizer import HybridTurboQuant
         pd35 = HybridTurboQuant.packed_dim_for_mode(HEAD_DIM, "tq35")
         pd25 = HybridTurboQuant.packed_dim_for_mode(HEAD_DIM, "tq25")
         assert pd25 < pd35
 
     def test_uniform_packed_size(self):
-        from turboquant.packing import packed_size
+        from aither_kvcache.packing import packed_size
         pd4 = packed_size(HEAD_DIM, 4)  # 4-bit: 128*4/8 = 64
         pd3 = packed_size(HEAD_DIM, 3)
         pd2 = packed_size(HEAD_DIM, 2)
@@ -421,7 +421,7 @@ class TestPackedDimConsistency:
     def test_engine_page_size_hybrid(self):
         """turboquant.vllm.engine._tq_page_size_bytes should use hybrid dims."""
         with patch.dict(os.environ, {"AITHER_TQ_MODE": "tq35"}):
-            from turboquant.vllm.engine import _tq_page_size_bytes
+            from aither_kvcache.vllm.engine import _tq_page_size_bytes
             page = _tq_page_size_bytes(BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM)
             assert page > 0
             # Should be smaller than FP16 page
@@ -430,7 +430,7 @@ class TestPackedDimConsistency:
 
     def test_engine_page_size_uniform(self):
         """turboquant.vllm.engine._tq_page_size_bytes should use uniform dims."""
-        import turboquant.vllm.engine as engine_mod
+        import aither_kvcache.vllm.engine as engine_mod
         old_bits = engine_mod._TQ_BITS
         try:
             engine_mod._TQ_BITS = 4
@@ -456,7 +456,7 @@ class TestCacheRoundtrip:
             packed_dim = tq.layout.packed_dim
             is_hybrid = True
         else:
-            from turboquant.packing import packed_size
+            from aither_kvcache.packing import packed_size
             packed_dim = packed_size(HEAD_DIM, tq.bits)
             is_hybrid = False
 

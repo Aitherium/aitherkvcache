@@ -18,20 +18,20 @@ import pytest
 import torch
 import numpy as np
 
-from turboquant.codebook import (
+from aither_kvcache.codebook import (
     get_codebook, get_theory_bounds, _STANDARD_CODEBOOKS,
 )
-from turboquant.rotation import (
+from aither_kvcache.rotation import (
     random_orthogonal, hadamard_matrix, randomized_hadamard_matrix,
     fast_hadamard_transform,
 )
-from turboquant.packing import (
+from aither_kvcache.packing import (
     pack_4bit, unpack_4bit,
     pack_3bit, unpack_3bit,
     pack_2bit, unpack_2bit,
     packed_size,
 )
-from turboquant import TurboQuant, TurboQuantConfig
+from aither_kvcache import TurboQuant, TurboQuantConfig
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

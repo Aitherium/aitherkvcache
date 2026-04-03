@@ -18,7 +18,7 @@ Phase 3 catches it when the module is finally loaded.
 
 Usage:
   Copy this file to your Python path as sitecustomize.py:
-    cp $(python -c "import turboquant.vllm.sitecustomize; print(turboquant.vllm.sitecustomize.__file__)") /path/to/sitecustomize.py
+    cp $(python -c "import aither_kvcache.vllm.sitecustomize; print(turboquant.vllm.sitecustomize.__file__)") /path/to/sitecustomize.py
     export PYTHONPATH="/path/to:$PYTHONPATH"
 
 Activated via: PYTHONPATH=/path/to AITHER_TQ_BITS=4 vllm serve ...
@@ -57,14 +57,14 @@ if _TQ_BITS in (2, 3, 4):
             _backend_registered = True
             try:
                 if _TQ_PRIMARY:
-                    from turboquant.vllm.hooks import apply_tq_hooks
+                    from aither_kvcache.vllm.hooks import apply_tq_hooks
                     ok = apply_tq_hooks()
                     pid = os.getpid()
                     status = "OK" if ok else "FAILED"
                     print(f"[TQ] pid={pid}: Hooks applied to TritonAttentionImpl ({status})",
                           file=sys.stderr)
                 else:
-                    from turboquant.vllm.backend import (
+                    from aither_kvcache.vllm.backend import (
                         register_turboquant_backend,
                     )
                     register_turboquant_backend()
@@ -78,7 +78,7 @@ if _TQ_BITS in (2, 3, 4):
         if not _patches_applied and name == "vllm.v1.kv_cache_interface":
             _patches_applied = True
             try:
-                from turboquant.vllm.engine import apply_tq_patches
+                from aither_kvcache.vllm.engine import apply_tq_patches
                 ok = apply_tq_patches(bits=_TQ_BITS)
                 pid = os.getpid()
                 status = "OK" if ok else "PARTIAL"
@@ -104,7 +104,7 @@ if _TQ_BITS in (2, 3, 4):
             try:
                 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
                 if not getattr(GPUModelRunner, "_tq_reshape_patched", False):
-                    from turboquant.vllm.engine import _patch_reshape
+                    from aither_kvcache.vllm.engine import _patch_reshape
                     ok = _patch_reshape()
                     pid = os.getpid()
                     status = "OK" if ok else "FAILED"

@@ -5,14 +5,14 @@ Usage:
     pip install aither-kvcache[vllm]
 
     # Hook mode (recommended -- zero graph breaks, CUDA-graphable):
-    from turboquant.vllm.hooks import apply_tq_hooks
+    from aither_kvcache.vllm.hooks import apply_tq_hooks
     apply_tq_hooks()
 
     # Plugin mode (legacy -- registers as CUSTOM backend):
     vllm serve model --attention-backend CUSTOM
 
     # Engine patches (PRIMARY mode -- TQ IS the KV cache):
-    from turboquant.vllm.engine import apply_tq_patches
+    from aither_kvcache.vllm.engine import apply_tq_patches
     apply_tq_patches(bits=4)
 """
 

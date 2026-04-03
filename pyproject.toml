@@ -34,14 +34,14 @@ vllm = ["vllm>=0.15"]
 all = ["triton>=2.0", "scipy", "pytest"]
 
 [project.entry-points."vllm.plugins"]
-aither_kvcache = "turboquant.vllm.plugin:register"
+aither_kvcache = "aither_kvcache.vllm.plugin:register"
 
 [project.urls]
 Paper = "https://arxiv.org/abs/2504.19874"
 Repository = "https://github.com/Aitherium/aitherkvcache"
 
 [tool.setuptools.packages.find]
-include = ["turboquant*"]
+include = ["aither_kvcache*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

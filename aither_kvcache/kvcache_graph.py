@@ -15,7 +15,7 @@ subgraph), and cross-session KV reuse.
 Standalone — no AitherOS dependencies.
 
 Usage:
-    from turboquant.kvcache_graph import KVCacheGraph, EdgeType
+    from aither_kvcache.kvcache_graph import KVCacheGraph, EdgeType
 
     graph = KVCacheGraph()
     graph.add_block(0, "system", 0.95, (0, 16))
@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
-logger = logging.getLogger("turboquant.kvcache_graph")
+logger = logging.getLogger("aither_kvcache.kvcache_graph")
 
 
 # ============================================================================

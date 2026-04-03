@@ -13,7 +13,7 @@ Graph-aware KV cache management:
   GraphEvictionAdvisor  — background thread for zero-latency eviction decisions
 
 Usage:
-    from turboquant import TurboQuant, HybridTurboQuant
+    from aither_kvcache import TurboQuant, HybridTurboQuant
 
     # Uniform 4-bit
     tq = TurboQuant(head_dim=128, bits=4, device='cuda')
@@ -21,7 +21,7 @@ Usage:
     decoded = tq.decode(packed, norms)
 
     # Graph-aware eviction
-    from turboquant import KVCacheGraph, GraphEvictionAdvisor
+    from aither_kvcache import KVCacheGraph, GraphEvictionAdvisor
 
     graph = KVCacheGraph(protected_sources={"system"})
     advisor = GraphEvictionAdvisor(graph)
