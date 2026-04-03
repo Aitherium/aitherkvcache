@@ -258,6 +258,128 @@ class TQPagedAttention:
                 block_tables, context_lens, block_size=16) -> Tensor
 ```
 
+## Graph-Aware KV Cache Eviction (v1.1+)
+
+Standard KV cache eviction (LRU/FIFO) doesn't know the difference between your system
+prompt and throwaway generation tokens. `KVCacheGraph` builds a relationship graph over
+physical KV cache blocks so eviction decisions understand what the blocks actually mean.
+
+### Quick Start
+
+```python
+from turboquant import KVCacheGraph, GraphEvictionAdvisor, EdgeType
+
+# 1. Create the graph — protect system prompt blocks from eviction
+graph = KVCacheGraph(protected_sources={"system", "tools"})
+
+# 2. Register blocks as they enter the KV cache
+graph.add_block(0, "system", importance=0.95, token_range=(0, 16))
+graph.add_block(1, "system", importance=0.90, token_range=(16, 32))
+graph.add_block(2, "user",   importance=0.60, token_range=(32, 48))
+graph.add_block(3, "assistant", importance=0.30, token_range=(48, 64))
+
+# 3. Feed attention patterns — edges form automatically
+graph.on_attention_step([0, 1, 2, 3])   # track co-attendance
+graph.on_temporal_sequence([2, 3])       # sequential generation
+graph.on_prefix_hit("req_42", [0, 1])   # prefix cache reuse
+
+# 4. Ask who to evict (system blocks are structurally protected)
+victims = graph.suggest_eviction(n_blocks=2)
+# -> returns least-connected, lowest-importance, non-protected blocks
+
+# 5. Ask what to prefetch from cold tier
+graph.on_spill([3])  # block 3 moved to DDR5
+prefetch = graph.suggest_prefetch(active_block_idxs=[0, 1, 2])
+# -> returns spilled blocks that are graph-neighbors of active set
+```
+
+### Background Advisor (zero decode-path overhead)
+
+For hot inference loops where you can't afford graph queries on the decode path:
+
+```python
+from turboquant import GraphEvictionAdvisor
+
+advisor = GraphEvictionAdvisor(graph, interval=0.5, max_stale=2.0)
+advisor.start()  # background thread recomputes rankings every 0.5s
+
+# Hot decode path — lock-free, zero overhead:
+candidates = advisor.get_eviction_candidates(n=16)   # pre-computed list or None
+prefetch = advisor.get_prefetch_candidates([0, 1], n=8)  # graph neighbor lookup
+
+advisor.stop()
+```
+
+The advisor pre-computes eviction rankings on a background thread. The decode path reads
+an atomically-swapped reference — no lock, no mutex, no blocking. If the ranking goes
+stale (>2s), returns None and the caller falls back to FIFO.
+
+### How Eviction Scoring Works
+
+The `suggest_eviction()` method scores every non-protected, non-spilled block:
+
+```
+score = age × 0.01          # older = more evictable
+      − degree × 5.0        # more graph connections = keep
+      − edge_weight × 2.0   # stronger edges = keep
+      − importance × 20.0   # higher importance = keep
+      − hit_count × 3.0     # more prefix cache hits = keep
+```
+
+Protected source labels are excluded entirely — they cannot be eviction candidates.
+
+### Six Edge Types
+
+| Edge Type | Created By | Meaning |
+|-----------|-----------|---------|
+| `PREFIX_SHARE` | `on_prefix_hit()` | Blocks reused across requests |
+| `CO_ATTEND` | `on_attention_step()` | Blocks frequently attended together |
+| `SEMANTIC` | `add_block(embedding=...)` | Similar key vector embeddings (cosine > 0.8) |
+| `TEMPORAL` | `on_temporal_sequence()` | Consecutive in same generation |
+| `SPILL_LINK` | `on_spill()` / `on_warm()` | Hot ↔ cold tier tracking |
+
+### Integration with Any Inference Engine
+
+The graph has no vLLM dependency. It works with any paged KV cache:
+
+1. Call `add_block()` when blocks are allocated
+2. Call `remove_block()` when blocks are freed
+3. Call `on_attention_step()` with active block indices each decode step
+4. Call `suggest_eviction()` when you need to free VRAM
+5. Call `suggest_prefetch()` to warm cold-tier blocks preemptively
+
+### API
+
+```python
+class KVCacheGraph:
+    def __init__(self, protected_sources={"system"}, coattend_threshold=3,
+                 semantic_threshold=0.8)
+    def add_block(self, block_idx, source_label, importance, token_range,
+                  embedding=None) -> KVBlockNode
+    def remove_block(self, block_idx) -> None
+    def add_edge(self, source, target, edge_type, weight=1.0) -> Optional[KVEdge]
+    def on_attention_step(self, active_block_idxs: List[int]) -> None
+    def on_prefix_hit(self, request_id: str, block_idxs: List[int]) -> None
+    def on_spill(self, block_idxs: List[int]) -> None
+    def on_warm(self, block_idxs: List[int]) -> None
+    def on_temporal_sequence(self, block_idxs: List[int]) -> None
+    def suggest_eviction(self, n_blocks, protect_sources=None) -> List[int]
+    def suggest_prefetch(self, active_block_idxs, max_suggestions=16) -> List[int]
+    def neighbors(self, block_idx, edge_type=None, max_depth=1) -> Set[int]
+    def subgraph(self, block_idxs) -> Dict
+    def get_stats(self) -> Dict
+
+class GraphEvictionAdvisor:
+    def __init__(self, graph=None, interval=0.5, max_stale=2.0, eviction_batch=256)
+    def start(self) -> None
+    def stop(self) -> None
+    def get_eviction_candidates(self, n: int) -> Optional[List[int]]
+    def get_prefetch_candidates(self, active_block_idxs, n=8) -> Optional[List[int]]
+    def get_stats(self) -> Dict
+
+def reorder_by_ranking(block_indices: List[int], ranked: List[int]) -> List[int]
+```
+
 ## Reference
 
 ```bibtex

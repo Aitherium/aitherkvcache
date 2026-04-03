@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aither-kvcache"
-version = "1.0.0"
-description = "Near-optimal KV cache quantization for LLM inference (arXiv:2504.19874)"
+version = "1.1.0"
+description = "Near-optimal KV cache quantization + graph-aware eviction for LLM inference"
 readme = "README.md"
 license = "CC-BY-4.0"
 requires-python = ">=3.10"

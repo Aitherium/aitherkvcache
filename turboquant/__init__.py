@@ -8,6 +8,10 @@ Two quantizer variants:
   TurboQuant       — uniform bit-width (2/3/4-bit), data-oblivious
   HybridTurboQuant — split-group (tq35/tq25), variance-based + QJL residual
 
+Graph-aware KV cache management:
+  KVCacheGraph          — relationship graph over KV cache blocks
+  GraphEvictionAdvisor  — background thread for zero-latency eviction decisions
+
 Usage:
     from turboquant import TurboQuant, HybridTurboQuant
 
@@ -16,18 +20,27 @@ Usage:
     packed, norms = tq.encode(kv_vectors)
     decoded = tq.decode(packed, norms)
 
-    # Hybrid 3.5-bit (better quality, same compression as TQ4)
-    htq = HybridTurboQuant(head_dim=128, mode='tq35', device='cuda')
-    htq.calibrate_uniform()  # or htq.calibrate(sample_data)
-    packed = htq.encode(kv_vectors)
-    decoded = htq.decode(packed)
+    # Graph-aware eviction
+    from turboquant import KVCacheGraph, GraphEvictionAdvisor
+
+    graph = KVCacheGraph(protected_sources={"system"})
+    advisor = GraphEvictionAdvisor(graph)
+    advisor.start()
+    candidates = advisor.get_eviction_candidates(n=16)
 """
 
 from .quantizer import TurboQuant, TurboQuantConfig
 from .hybrid_quantizer import HybridTurboQuant, HybridLayout, GroupLayout
+from .kvcache_graph import KVCacheGraph, KVBlockNode, KVEdge, EdgeType, get_kvcache_graph
+from .eviction_advisor import GraphEvictionAdvisor, reorder_by_ranking
 
 __all__ = [
+    # Quantizers
     "TurboQuant", "TurboQuantConfig",
     "HybridTurboQuant", "HybridLayout", "GroupLayout",
+    # KV cache graph
+    "KVCacheGraph", "KVBlockNode", "KVEdge", "EdgeType", "get_kvcache_graph",
+    # Eviction advisor
+    "GraphEvictionAdvisor", "reorder_by_ranking",
 ]
-__version__ = "1.0.0"
+__version__ = "1.1.0"
