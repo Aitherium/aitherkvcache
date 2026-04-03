@@ -37,4 +37,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff
-      - run: ruff check turboquant/ tests/
+      - run: ruff check aither_kvcache/ tests/
