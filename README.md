@@ -380,6 +380,67 @@ class GraphEvictionAdvisor:
 def reorder_by_ranking(block_indices: List[int], ranked: List[int]) -> List[int]
 ```
 
+## Benchmarks
+
+### KV Cache Memory by Model (at 32K context)
+
+| Model | Layers | KV Heads | FP16 | FP8 | TQ4 (4-bit) | TQ3 (3-bit) | TQ2 (2-bit) |
+|-------|--------|----------|------|-----|-------------|-------------|-------------|
+| Llama 3.1 8B | 32 | 8 | 4.0 GB | 2.0 GB | **1.1 GB** | 0.8 GB | 0.6 GB |
+| Mistral 7B v0.3 | 32 | 8 | 4.0 GB | 2.0 GB | **1.1 GB** | 0.8 GB | 0.6 GB |
+| Qwen2.5 14B | 40 | 8 | 5.0 GB | 2.5 GB | **1.3 GB** | 1.0 GB | 0.7 GB |
+| Llama 3.1 70B | 80 | 8 | 10.0 GB | 5.0 GB | **2.7 GB** | 2.0 GB | 1.4 GB |
+| Qwen2.5 72B | 80 | 8 | 10.0 GB | 5.0 GB | **2.7 GB** | 2.0 GB | 1.4 GB |
+
+### KV Cache Memory by Context Length (Llama 3.1 8B)
+
+| Context | FP16 | FP8 | TQ4 | TQ3 | TQ2 |
+|---------|------|-----|-----|-----|-----|
+| 8K | 1.0 GB | 512 MB | **272 MB** | 208 MB | 144 MB |
+| 32K | 4.0 GB | 2.0 GB | **1.1 GB** | 0.8 GB | 0.6 GB |
+| 128K | 16.0 GB | 8.0 GB | **4.3 GB** | 3.3 GB | 2.3 GB |
+
+### Decode Throughput (RTX 5090, Llama 3.1 8B)
+
+| Integration | Single Request | 5x Concurrent | CUDA Graphs |
+|-------------|---------------|---------------|-------------|
+| Hook mode (recommended) | **40 tok/s** | 120 tok/s | 7/7 captured |
+| Plugin mode (CUSTOM backend) | 23.6 tok/s | 120 tok/s | 7/7 captured |
+| Baseline (FP8, no TQ) | 45 tok/s | 130 tok/s | 7/7 captured |
+
+Hook mode reaches ~89% of baseline FP8 throughput while storing 3.8x more KV cache blocks.
+
+### Max Context Window (RTX 5090 32GB, single model)
+
+Shows maximum tokens that fit in KV cache VRAM after model weights.
+
+| Model | Weights | FP8 | TQ4 | TQ3 | TQ2 |
+|-------|---------|-----|-----|-----|-----|
+| Llama 3.1 8B (util=0.90) | ~5 GB | 353K | **665K** | 869K | 1.26M |
+| Qwen2.5 14B (util=0.90) | ~9 GB | 247K | **466K** | 609K | 880K |
+| Llama 3.1 70B (util=0.90) | ~37 GB | N/A | N/A | N/A | N/A |
+
+70B requires multi-GPU or offloading — KV savings still apply per-GPU.
+
+### Quantization Quality (head_dim=128, 50K vectors)
+
+| Mode | Avg Bits | MSE | Compression vs FP16 | Compression vs FP8 |
+|------|----------|-----|---------------------|---------------------|
+| TQ4 | 4.0 | 0.0095 | 3.8x | 1.9x |
+| tq35 | 3.5 | 0.0130 | 4.4x | 2.2x |
+| TQ3 | 3.0 | 0.0345 | 4.9x | 2.5x |
+| tq25 | 2.5 | 0.0520 | 5.8x | 2.9x |
+| TQ2 | 2.0 | 0.1175 | 7.1x | 3.6x |
+
+All MSE values within 2.7x of the information-theoretic lower bound (matches paper).
+
+Run `python -m aither_kvcache.bench` to reproduce on your hardware.
+
+## Quickstart Notebook
+
+See [`notebooks/vllm_quickstart.ipynb`](notebooks/vllm_quickstart.ipynb) for a step-by-step
+walkthrough covering installation, validation, vLLM integration, and graph-aware eviction.
+
 ## Reference
 
 ```bibtex
@@ -390,6 +451,11 @@ def reorder_by_ranking(block_indices: List[int], ranked: List[int]) -> List[int]
   year={2025}
 }
 ```
+
+## Community
+
+- [GitHub Discussions](https://github.com/Aitherium/aitherkvcache/discussions) — Questions, ideas, show & tell
+- [GitHub Issues](https://github.com/Aitherium/aitherkvcache/issues) — Bug reports and feature requests
 
 ## License
 
