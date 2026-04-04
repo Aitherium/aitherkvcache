@@ -177,7 +177,7 @@ if HAS_TRITON:
             return
 
         base = pid * D
-        out_base = pid * PACKED_D
+        pid * PACKED_D
 
         for g in tl.static_range(GROUPS):
             # Load 8 coordinates for this group
@@ -192,7 +192,7 @@ if HAS_TRITON:
 
             # Pack 8 × 3-bit into 24 bits (3 bytes)
             # Accumulate bit-shifted values
-            bits24 = tl.zeros([], dtype=tl.int32)
+            tl.zeros([], dtype=tl.int32)
             for i in tl.static_range(8):
                 # Can't index a register tensor by i directly in all Triton versions,
                 # but static_range + element access should work

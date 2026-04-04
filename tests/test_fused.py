@@ -12,11 +12,9 @@ import math
 import pytest
 import torch
 
-from aither_kvcache.quantizer import TurboQuant, TurboQuantConfig
+from aither_kvcache.quantizer import TurboQuant
 from aither_kvcache.rotation import random_orthogonal
-from aither_kvcache.codebook import get_codebook
-from aither_kvcache.packing import pack_4bit, unpack_4bit
-from aither_kvcache.fused_attention import TQPagedAttentionRef, TQPagedAttention
+from aither_kvcache.fused_attention import TQPagedAttention
 
 DEVICE = "cpu"
 HEAD_DIM = 128
@@ -107,16 +105,16 @@ class TestRotatedDomainMath:
 
         # Online
         m = torch.tensor(float("-inf"))
-        l = torch.tensor(0.0)
+        lse = torch.tensor(0.0)
         for s in scores:
             m_new = torch.maximum(m, s)
             alpha = torch.exp(m - m_new)
             beta = torch.exp(s - m_new)
-            l = alpha * l + beta
+            lse = alpha * lse + beta
             m = m_new
 
         # Recompute weights
-        online_weights = torch.exp(scores - m) / l
+        online_weights = torch.exp(scores - m) / lse
 
         torch.testing.assert_close(online_weights, expected, atol=1e-5, rtol=1e-5)
 

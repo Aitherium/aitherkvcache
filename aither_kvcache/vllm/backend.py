@@ -39,7 +39,6 @@ triggers lazy creation only after all vLLM modules are loaded.
 
 import os
 import logging
-import time
 from typing import ClassVar, Optional, Set
 
 import torch
@@ -741,8 +740,7 @@ def _make_impl_class():
             key_cache = kv_cache[:, 0]    # [blocks, block_size, heads, tq_dim]
             value_cache = kv_cache[:, 1]
             num_blocks = key_cache.shape[0]
-            block_size = key_cache.shape[1]
-            num_layers = TurboQuantImpl._tq_layer_counter
+            key_cache.shape[1]
             # Norms are initialized in do_kv_cache_update (called first).
 
             # Lazy-init block selector for sparse attention
@@ -922,11 +920,11 @@ def _make_impl_class():
 
             Expected throughput: 50-70 tok/s (up from 8-23 with decompress).
             """
-            packed_dim = self.head_size // 2
+            self.head_size // 2
             key_cache = kv_cache[:, 0]      # [B, bs, H, tq_dim] uint8
-            value_cache = kv_cache[:, 1]
-            num_blocks = key_cache.shape[0]
-            block_size = key_cache.shape[1]
+            kv_cache[:, 1]
+            key_cache.shape[0]
+            key_cache.shape[1]
             li = self._tq_layer_idx
 
             # Ensure TQ quantizer + fused attention exist

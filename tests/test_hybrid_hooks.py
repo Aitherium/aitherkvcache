@@ -3,9 +3,8 @@
 Tests the hybrid encode/decode through hooks, clamp-gather decompress,
 masked batched SDPA, mode detection, quantizer init, and packed dim consistency.
 """
-import math
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import torch

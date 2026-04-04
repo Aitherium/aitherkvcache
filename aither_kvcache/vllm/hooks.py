@@ -27,10 +27,9 @@ Set AITHER_TQ_DEBUG_STEPS=N to log the first N forward calls per layer-0
 """
 
 import logging
-import math
 import os
 import sys
-from typing import ClassVar, Optional
+from typing import Optional
 
 import torch
 

@@ -421,8 +421,8 @@ class TestMemoryReport:
         for bits in [2, 3, 4]:
             tq = TurboQuant(head_dim=128, bits=bits, device="cpu")
             reports[bits] = tq.memory_report(seq_len=10000)
-        assert reports[2][f"tq2_mb"] < reports[3][f"tq3_mb"]
-        assert reports[3][f"tq3_mb"] < reports[4][f"tq4_mb"]
+        assert reports[2]["tq2_mb"] < reports[3]["tq3_mb"]
+        assert reports[3]["tq3_mb"] < reports[4]["tq4_mb"]
 
 
 # ============================================================================

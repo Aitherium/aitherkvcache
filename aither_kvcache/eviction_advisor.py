@@ -221,7 +221,7 @@ def reorder_by_ranking(
     Useful for integrating with existing eviction code that expects an
     ordered list of candidates.
     """
-    ranked_set = set(ranked)
+    set(ranked)
     front = [b for b in ranked if b in set(block_indices)]
     front_set = set(front)
     tail = [b for b in block_indices if b not in front_set]

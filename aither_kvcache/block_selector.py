@@ -20,7 +20,6 @@ Integration:
 """
 
 import math
-import os
 import torch
 from typing import Optional, Tuple
 
@@ -107,7 +106,7 @@ class BlockRepresentativeCache:
         If block_indices is None, finalizes all blocks with count > 0.
         """
         if block_indices is not None:
-            mask = self._counts[block_indices] > 0
+            self._counts[block_indices] > 0
             safe_count = self._counts[block_indices].clamp(min=1).unsqueeze(-1).float()
             self.rep_even[block_indices] = self._acc_even[block_indices] / safe_count
             self.rep_odd[block_indices] = self._acc_odd[block_indices] / safe_count

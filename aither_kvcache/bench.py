@@ -1,23 +1,12 @@
 """
 TurboQuant Benchmark — Validate correctness and measure performance.
 
-Run directly:
-    python -m lib.gpu.turboquant.bench
-
-Or from repo root:
-    python AitherOS/lib/gpu/turboquant/bench.py
+Run:
+    python -m aither_kvcache.bench
 """
 
-import sys
-import os
-import time
-
-# Allow running from repo root
-if os.path.exists("AitherOS"):
-    sys.path.insert(0, "AitherOS")
-
 import torch
-from lib.gpu.turboquant import TurboQuant, TurboQuantConfig
+from aither_kvcache import TurboQuant
 
 
 def banner(text: str):
@@ -140,7 +129,7 @@ def run_context_impact():
 
 
 if __name__ == "__main__":
-    print("TurboQuant v0.1.0 — KV Cache Quantization Benchmark")
+    print("TurboQuant v1.1.1 — KV Cache Quantization Benchmark")
     print("Paper: arXiv:2504.19874 (Zandieh et al., 2025)")
 
     run_validation()

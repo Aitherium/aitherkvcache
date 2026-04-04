@@ -125,7 +125,7 @@ class TQPagedAttentionRef:
 
                 # Online softmax accumulators
                 m = torch.tensor(float("-inf"), device=device)
-                l = torch.tensor(0.0, device=device)
+                lse = torch.tensor(0.0, device=device)
                 acc_even = torch.zeros_like(q_rot_even)
                 acc_odd = torch.zeros_like(q_rot_odd)
 
@@ -153,7 +153,7 @@ class TQPagedAttentionRef:
                         m_new = torch.maximum(m, score)
                         alpha = torch.exp(m - m_new)
                         beta = torch.exp(score - m_new)
-                        l = alpha * l + beta
+                        lse = alpha * lse + beta
                         acc_even = alpha * acc_even
                         acc_odd = alpha * acc_odd
                         m = m_new
@@ -169,9 +169,9 @@ class TQPagedAttentionRef:
                         acc_odd = acc_odd + beta * v_norm * v_odd
 
                 # Normalize
-                if l > 0:
-                    acc_even = acc_even / l
-                    acc_odd = acc_odd / l
+                if lse > 0:
+                    acc_even = acc_even / lse
+                    acc_odd = acc_odd / lse
 
                 # Interleave even/odd back to full head_dim
                 out_rot = torch.zeros(self.head_dim, device=device, dtype=torch.float32)

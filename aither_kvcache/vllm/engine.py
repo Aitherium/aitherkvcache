@@ -242,7 +242,6 @@ def _patch_reshape() -> bool:
             [num_blocks, 2, block_size, num_kv_heads, tq_dim].
         """
         import torch
-        from ..packing import packed_size
 
         # Check if any MambaSpec layers exist -- if so, we need the original
         # method for those.  We handle AttentionSpec layers ourselves.
@@ -259,7 +258,7 @@ def _patch_reshape() -> bool:
                                     kv_cache_raw_tensors, kernel_block_sizes)
 
         try:
-            from vllm.v1.kv_cache_interface import MambaSpec
+            from vllm.v1.kv_cache_interface import MambaSpec  # noqa: F401
             _has_mamba_spec = True
         except ImportError:
             _has_mamba_spec = False

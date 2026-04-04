@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from aither_kvcache.kvcache_graph import KVCacheGraph, EdgeType, get_kvcache_graph
+from aither_kvcache.kvcache_graph import KVCacheGraph, EdgeType
 from aither_kvcache.eviction_advisor import GraphEvictionAdvisor, reorder_by_ranking
 
 

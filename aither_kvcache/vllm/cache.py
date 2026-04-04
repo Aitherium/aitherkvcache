@@ -6,7 +6,6 @@ ColdTierCache: Async background thread CPU cold tier (Phase 1 fallback).
 """
 
 import logging
-import os
 import threading
 from collections import deque
 from typing import Optional, Set

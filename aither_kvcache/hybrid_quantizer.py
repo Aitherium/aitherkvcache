@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import functools
 import math
-import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -405,7 +404,7 @@ def _pack_sign_bits(x: torch.Tensor) -> torch.Tensor:
     Returns:
         [..., ceil(dim / 8)] uint8 tensor.
     """
-    dim = x.shape[-1]
+    x.shape[-1]
     signs = (x >= 0).to(torch.uint8)     # 1 for positive, 0 for negative
     return pack_multibit(signs, bits=1)
 
@@ -679,8 +678,7 @@ class HybridTurboQuant:
         Returns:
             [N, packed_dim] uint8
         """
-        N = x.shape[0]
-        device = x.device
+        x.shape[0]
 
         # Gather group dimensions
         x_g0 = x[:, g0_idx]  # [N, g0_dim]
@@ -733,9 +731,8 @@ class HybridTurboQuant:
         Returns:
             [N, layout.total_bytes] uint8 packed tensor.
         """
-        N = x_group.shape[0]
-        G = x_group.shape[1]
-        device = x_group.device
+        x_group.shape[0]
+        x_group.shape[1]
 
         # 1. Compute L2 norm
         vec_norm = x_group.norm(dim=-1)                       # [N]
