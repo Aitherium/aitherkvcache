@@ -17,6 +17,9 @@ logger = logging.getLogger("aither_kvcache.vllm")
 
 def register():
     """Register aither-kvcache components in vLLM."""
+    import sys
+
+    print("[aither-kvcache] Plugin register() called", file=sys.stderr, flush=True)
 
     # 1. Register TurboQuant attention backend
     try:
@@ -28,18 +31,23 @@ def register():
             AttentionBackendEnum.CUSTOM,
             "aither_kvcache.vllm.backend.TurboQuantBackend",
         )
-        logger.info("Registered TurboQuant CUSTOM attention backend")
+        print("[aither-kvcache] Registered TurboQuant CUSTOM backend",
+              file=sys.stderr, flush=True)
     except ImportError:
-        logger.debug("vLLM v1 not available — backend not registered")
+        pass  # vLLM v1 not available
     except Exception as e:
-        logger.warning("Failed to register TurboQuant backend: %s", e)
+        print(f"[aither-kvcache] Backend registration failed: {e}",
+              file=sys.stderr, flush=True)
 
     # 2. Install graph-aware eviction (unless disabled)
     if os.environ.get("AITHER_TQ_NO_GRAPH_EVICTION") != "1":
         try:
             from .eviction_plugin import install_graph_eviction
             install_graph_eviction()
+            print("[aither-kvcache] Graph-aware eviction installed",
+                  file=sys.stderr, flush=True)
         except ImportError:
-            logger.debug("Graph eviction not available")
+            pass
         except Exception as e:
-            logger.warning("Failed to install graph eviction: %s", e)
+            print(f"[aither-kvcache] Eviction install failed: {e}",
+                  file=sys.stderr, flush=True)
