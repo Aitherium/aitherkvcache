@@ -27,9 +27,10 @@ Set AITHER_TQ_DEBUG_STEPS=N to log the first N forward calls per layer-0
 """
 
 import logging
+import math
 import os
 import sys
-from typing import Optional
+from typing import ClassVar, Optional
 
 import torch
 
@@ -180,7 +181,7 @@ def _register_custom_ops():
                 context_lens=seq_lens,
             )
             output[:num_actual] = fused_out.to(output.dtype)
-            return output
+            return output.clone()
 
         @_decode_step_op.register_fake
         def _decode_step_fake(
@@ -190,7 +191,7 @@ def _register_custom_ops():
             num_actual,
         ):
             """Shape inference for torch.compile tracing."""
-            return output
+            return output.clone()
 
         _USE_CUSTOM_OP = True
         logger.info("TQ custom op registered: tq::decode_step "
@@ -331,7 +332,7 @@ def _register_hybrid_custom_ops():
                 q, k, v, attn_mask=attn_mask, scale=scale)
             # [S, H, 1, D] -> [S, H, D]
             output[:num_actual] = attn_out.squeeze(2).to(output.dtype)
-            return output
+            return output.clone()
 
         @_hybrid_decode_step_op.register_fake
         def _hybrid_decode_step_fake(
@@ -341,7 +342,7 @@ def _register_hybrid_custom_ops():
             num_actual,
         ):
             """Shape inference for torch.compile tracing."""
-            return output
+            return output.clone()
 
         _USE_HYBRID_CUSTOM_OP = True
         logger.info("TQ hybrid custom op registered: tq::hybrid_decode_step "
@@ -479,6 +480,17 @@ def _tq_encode_phase(layer_idx, key, value, kv_cache, slot_mapping):
 
         _primary_k_norms[layer_idx, bi, oi] = kn.reshape(N, H).to(torch.float32)
         _primary_v_norms[layer_idx, bi, oi] = vn.reshape(N, H).to(torch.float32)
+
+    # VALIDATION: verify encode/decode roundtrip in cache
+    if _TQ_DEBUG and _stats.encode_calls < 2 and not _TQ_IS_HYBRID:
+        import torch.nn.functional as _F
+        kp_back = key_cache[bi[:1], oi[:1], :, :packed_dim]
+        kn_back = _primary_k_norms[layer_idx, bi[:1], oi[:1]]
+        k_dec = tq.decode(kp_back.reshape(-1, packed_dim), kn_back.reshape(-1))
+        k_orig = vk[:1].reshape(-1, D).float()
+        cos = _F.cosine_similarity(k_orig, k_dec.float(), dim=-1).mean().item()
+        _dbg(f"VALIDATE L{layer_idx}: encode/decode cosine={cos:.4f} "
+             f"orig[0]={k_orig[0,:3].tolist()} dec[0]={k_dec[0,:3].float().tolist()}")
 
     # Stats
     _stats.encode_calls += 1
@@ -791,9 +803,28 @@ def _tq_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
         # NOTE: is_causal=True with q_len < kv_len is documented to work in
         # PyTorch 2.2+ but produces degenerate (constant) output on some
         # model/backend combinations. is_causal=False is correct and safe.
-        use_causal = (q_len == kv_len)
-        out_i = F.scaled_dot_product_attention(
-            qi_4d, ki_4d, vi_4d, is_causal=use_causal, scale=scale)
+        # Causal masking: for continuation (q_len < kv_len), we need a
+        # proper causal mask that accounts for the prior context offset.
+        # is_causal=True only works when q_len == kv_len.
+        # For q_len < kv_len, build an explicit mask.
+        if q_len == kv_len:
+            out_i = F.scaled_dot_product_attention(
+                qi_4d, ki_4d, vi_4d, is_causal=True, scale=scale)
+        else:
+            # Build causal mask: query position j can attend to KV position k
+            # where k <= (kv_len - q_len) + j  (prior context + current pos)
+            prior_len = kv_len - q_len
+            q_pos = torch.arange(q_len, device=qi_4d.device).unsqueeze(1)
+            k_pos = torch.arange(kv_len, device=qi_4d.device).unsqueeze(0)
+            causal_mask = k_pos <= (prior_len + q_pos)
+            # SDPA expects [1, 1, q_len, kv_len] bool mask or float -inf mask
+            attn_mask = torch.where(
+                causal_mask.unsqueeze(0).unsqueeze(0),
+                torch.tensor(0.0, device=qi_4d.device),
+                torch.tensor(float('-inf'), device=qi_4d.device),
+            )
+            out_i = F.scaled_dot_product_attention(
+                qi_4d, ki_4d, vi_4d, attn_mask=attn_mask, scale=scale)
 
         out_i = out_i.squeeze(0).transpose(0, 1)
         output[q_start:q_end] = out_i.to(output.dtype)
@@ -981,40 +1012,30 @@ def _make_tq_forward(original_fwd):
                              self._tq_layer_idx, e)
                 # Fall through to SDPA path
 
-        # --- Phase 1: TQ encode new K,V (prefill only) ---
-        # Decode path encodes inside _tq_decode_step above.
-        # vLLM v1 pads key/value to chunk size but slot_mapping has only
-        # num_actual_tokens entries. Slice to match.
+        # --- Prefill: encode to TQ cache + use ORIGINAL attention ---
+        # The original TritonAttentionImpl.forward handles:
+        #   - Paged cache write (do_kv_cache_update)
+        #   - Fused triton attention kernel (reads from paged cache)
+        #   - Chunked prefill with correct causal masking
+        # We just need to ALSO encode to our TQ cache for future decode.
+        # The original forward writes to the SAME kv_cache tensor (now uint8),
+        # which works because TritonAttention writes raw bytes via
+        # reshape_and_cache_flash (FP8_KV_CACHE=False path stores as-is).
         if key is not None and value is not None:
             try:
                 num_actual = attn_metadata.num_actual_tokens
-                if _TQ_DEBUG and self._tq_layer_idx == 0:
-                    if not hasattr(tq_forward, '_enc_times'):
-                        tq_forward._enc_times = []
-                    import time as _time
-                    _t0 = _time.perf_counter()
                 _tq_encode_phase(
                     self._tq_layer_idx,
                     key[:num_actual], value[:num_actual],
                     kv_cache, attn_metadata.slot_mapping)
-                if _TQ_DEBUG and self._tq_layer_idx == 0:
-                    tq_forward._enc_times.append((_time.perf_counter() - _t0) * 1000)
-                    if len(tq_forward._enc_times) == 50:
-                        avg = sum(tq_forward._enc_times) / len(tq_forward._enc_times)
-                        _dbg(f"ENCODE avg={avg:.2f}ms over 50 calls")
             except Exception as e:
                 logger.error("TQ encode error L%d: %s", self._tq_layer_idx, e)
 
-        # Prefill / decode: SDPA with raw K/V + decompressed prior context
-        try:
-            return _tq_prefill_sdpa(
-                self._tq_layer_idx, query, key, value, kv_cache,
-                attn_metadata, output, self.num_heads, self.num_kv_heads,
-                self.head_size, self.scale)
-        except Exception as e:
-            logger.error("TQ SDPA error L%d: %s", self._tq_layer_idx, e)
-            output.fill_(0)
-            return output
+        # Use original vLLM forward for attention (handles chunked prefill correctly)
+        return original_fwd(
+            self, layer, query, key, value, kv_cache, attn_metadata,
+            output=output, output_scale=output_scale,
+            output_block_scale=output_block_scale)
 
     return tq_forward
 
@@ -1063,3 +1084,59 @@ def apply_tq_hooks() -> bool:
     logger.info("TQ hooks applied to TritonAttentionImpl.forward "
                 "(%s, debug %s)", op_status, debug_status)
     return True
+
+# TEMP DEBUG: monkey-patch _tq_prefill_sdpa to dump decompress info
+_orig_prefill_sdpa = _tq_prefill_sdpa
+
+def _debug_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
+                         output, num_heads, num_kv_heads, head_size, scale):
+    import sys
+    if layer_idx == 0:
+        num_actual = attn_metadata.num_actual_tokens
+        cu = attn_metadata.query_start_loc
+        sl = attn_metadata.seq_lens
+        ns = cu.shape[0] - 1
+        for i in range(ns):
+            qs = cu[i].item()
+            qe = cu[i+1].item()
+            ql = qe - qs
+            cl = sl[i].item()
+            print(f"[TQ-DBG] L0 seq{i}: q_len={ql}, ctx_len={cl}, prior={cl-ql}",
+                  file=sys.stderr, flush=True)
+            if cl > ql and key is not None:
+                # This is a continuation — prior blocks need decompressing
+                bt = attn_metadata.block_table
+                block_size = kv_cache[:, 0].shape[1]
+                prior_len = cl - ql
+                prior_blocks = (prior_len + block_size - 1) // block_size
+                block_ids = bt[i, :prior_blocks]
+                print(f"[TQ-DBG] L0 seq{i}: reading blocks={block_ids.tolist()}, "
+                      f"block_size={block_size}, prior_len={prior_len}",
+                      file=sys.stderr, flush=True)
+
+                # Check norms
+                if _primary_k_norms is not None:
+                    kn = _primary_k_norms[0, block_ids[0], :4, :2]
+                    print(f"[TQ-DBG] L0 norms block0 first 4 slots x 2 heads: {kn.tolist()}",
+                          file=sys.stderr, flush=True)
+
+                # Decode first few vectors and check
+                tq = _tq_quantizer
+                packed_dim = _tq_packed_dim
+                kc = kv_cache[:, 0]
+                kp0 = kc[block_ids[0], 0, 0, :packed_dim]  # first slot, first head
+                kn0 = _primary_k_norms[0, block_ids[0], 0, 0]  # first slot, first head
+                dk0 = tq.decode(kp0.unsqueeze(0), kn0.unsqueeze(0))
+                print(f"[TQ-DBG] L0 decoded block0_slot0_head0 first5: {dk0[0,:5].float().tolist()} norm={dk0.float().norm().item():.2f}",
+                      file=sys.stderr, flush=True)
+
+                # Compare with raw key if available
+                if key is not None:
+                    raw_k0 = key[qs, 0, :5].float()  # first token of current chunk, head 0
+                    print(f"[TQ-DBG] L0 raw_key current_chunk[0] head0 first5: {raw_k0.tolist()}",
+                          file=sys.stderr, flush=True)
+
+    return _orig_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
+                               output, num_heads, num_kv_heads, head_size, scale)
+
+_tq_prefill_sdpa = _debug_prefill_sdpa
