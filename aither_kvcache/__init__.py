@@ -43,4 +43,4 @@ __all__ = [
     # Eviction advisor
     "GraphEvictionAdvisor", "reorder_by_ranking",
 ]
-__version__ = "1.1.1"
+__version__ = "1.2.0"

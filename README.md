@@ -460,3 +460,14 @@ walkthrough covering installation, validation, vLLM integration, and graph-aware
 ## License
 
 CC BY 4.0
+
+## vLLM Integration (upstream)
+
+Native vLLM integration is in progress via [PR #39008](https://github.com/vllm-project/vllm/pull/39008):
+
+```bash
+# Once merged:
+vllm serve your-model --kv-cache-dtype tq4
+```
+
+Until then, use the hook-based or plugin-based integration from this package (see above).
