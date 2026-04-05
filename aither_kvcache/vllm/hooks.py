@@ -27,10 +27,9 @@ Set AITHER_TQ_DEBUG_STEPS=N to log the first N forward calls per layer-0
 """
 
 import logging
-import math
 import os
 import sys
-from typing import ClassVar, Optional
+from typing import Optional
 
 import torch
 
@@ -1092,7 +1091,6 @@ def _debug_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
                          output, num_heads, num_kv_heads, head_size, scale):
     import sys
     if layer_idx == 0:
-        num_actual = attn_metadata.num_actual_tokens
         cu = attn_metadata.query_start_loc
         sl = attn_metadata.seq_lens
         ns = cu.shape[0] - 1

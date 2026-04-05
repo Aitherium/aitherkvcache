@@ -4,16 +4,18 @@ aither-kvcache vLLM integration.
 Usage:
     pip install aither-kvcache[vllm]
 
-    # Hook mode (recommended -- zero graph breaks, CUDA-graphable):
+    # Automatic (plugin loaded by vLLM at startup):
+    #   - TurboQuant backend registered as CUSTOM
+    #   - Graph-aware eviction replaces LRU
+    # Just: vllm serve model --attention-backend CUSTOM
+
+    # Manual hook mode (deprecated, use plugin instead):
     from aither_kvcache.vllm.hooks import apply_tq_hooks
     apply_tq_hooks()
 
-    # Plugin mode (legacy -- registers as CUSTOM backend):
-    vllm serve model --attention-backend CUSTOM
-
-    # Engine patches (PRIMARY mode -- TQ IS the KV cache):
-    from aither_kvcache.vllm.engine import apply_tq_patches
-    apply_tq_patches(bits=4)
+    # Graph eviction only (works with ANY attention backend):
+    from aither_kvcache.vllm.eviction_plugin import install_graph_eviction
+    install_graph_eviction()
 """
 
 from .plugin import register
