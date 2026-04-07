@@ -17,6 +17,7 @@ Reference: Zandieh et al., "TurboQuant: Online Vector Quantization with
 Near-optimal Distortion Rate", arXiv:2504.19874, April 2025.
 """
 
+import math
 import time
 import torch
 from dataclasses import dataclass
@@ -137,7 +138,7 @@ class TurboQuant:
         # vLLM's paged KV cache passes strided views; non-contiguous tensors
         # cause CUDA segfaults on Blackwell (sm_100) in matmul and Triton JIT.
         x_flat = x.reshape(-1, self.head_dim).float().contiguous()
-        x_flat.shape[0]
+        N = x_flat.shape[0]
 
         # 1) Compute norms
         norms = x_flat.norm(dim=-1)

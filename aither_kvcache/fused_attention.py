@@ -125,7 +125,7 @@ class TQPagedAttentionRef:
 
                 # Online softmax accumulators
                 m = torch.tensor(float("-inf"), device=device)
-                lse = torch.tensor(0.0, device=device)
+                l = torch.tensor(0.0, device=device)
                 acc_even = torch.zeros_like(q_rot_even)
                 acc_odd = torch.zeros_like(q_rot_odd)
 
@@ -153,7 +153,7 @@ class TQPagedAttentionRef:
                         m_new = torch.maximum(m, score)
                         alpha = torch.exp(m - m_new)
                         beta = torch.exp(score - m_new)
-                        lse = alpha * lse + beta
+                        l = alpha * l + beta
                         acc_even = alpha * acc_even
                         acc_odd = alpha * acc_odd
                         m = m_new
@@ -169,9 +169,9 @@ class TQPagedAttentionRef:
                         acc_odd = acc_odd + beta * v_norm * v_odd
 
                 # Normalize
-                if lse > 0:
-                    acc_even = acc_even / lse
-                    acc_odd = acc_odd / lse
+                if l > 0:
+                    acc_even = acc_even / l
+                    acc_odd = acc_odd / l
 
                 # Interleave even/odd back to full head_dim
                 out_rot = torch.zeros(self.head_dim, device=device, dtype=torch.float32)
@@ -200,109 +200,6 @@ class TQPagedAttentionRef:
 # ============================================================================
 
 if HAS_TRITON:
-
-    # ================================================================
-    # FUSED ROTATION KERNELS — eliminate per-layer matmul overhead
-    # ================================================================
-    # Pre-rotate:  query[bf16] → q_even[f32], q_odd[f32]  (1 kernel vs 4 CUDA ops)
-    # Post-rotate: out_even[f32], out_odd[f32] → output[bf16]  (1 kernel vs 3 CUDA ops)
-
-    @triton.jit
-    def _tq_rotate_query(
-        q_ptr,        # [num_seqs, num_heads, D] bf16/f16
-        rot_even_ptr, # [D, HALF_D] f32 — rotation_T[:, 0::2]
-        rot_odd_ptr,  # [D, HALF_D] f32 — rotation_T[:, 1::2]
-        qe_ptr,       # [num_seqs, num_heads, HALF_D] f32 output (even)
-        qo_ptr,       # [num_seqs, num_heads, HALF_D] f32 output (odd)
-        stride_q_seq, stride_q_head,
-        stride_r_row,   # stride for rot_even/rot_odd rows
-        stride_o_seq, stride_o_head,
-        HALF_D: tl.constexpr,
-        D: tl.constexpr,
-    ):
-        """Fused: cast to f32 + rotate query + split even/odd.
-
-        Grid: (num_heads, num_seqs)
-        Uses pre-split rotation matrices to avoid strided loads.
-        q_even = query @ rotation_T[:, 0::2]
-        q_odd  = query @ rotation_T[:, 1::2]
-        Done as tl.dot of [1, D] x [D, HALF_D] = [1, HALF_D].
-        """
-        head = tl.program_id(0)
-        seq = tl.program_id(1)
-
-        # Load query vector [1, D] as f32
-        q_base = seq * stride_q_seq + head * stride_q_head
-        d_offs = tl.arange(0, D)
-        q_row = tl.load(q_ptr + q_base + d_offs).to(tl.float32)
-        q_mat = q_row[None, :]  # [1, D]
-
-        # Load rotation even/odd: [D, HALF_D]
-        half_offs = tl.arange(0, HALF_D)
-        rot_e = tl.load(
-            rot_even_ptr
-            + d_offs[:, None] * stride_r_row
-            + half_offs[None, :])   # [D, HALF_D]
-        rot_o = tl.load(
-            rot_odd_ptr
-            + d_offs[:, None] * stride_r_row
-            + half_offs[None, :])   # [D, HALF_D]
-
-        # Matmul: [1, D] x [D, HALF_D] = [1, HALF_D]
-        qe = tl.dot(q_mat, rot_e)  # [1, HALF_D]
-        qo = tl.dot(q_mat, rot_o)  # [1, HALF_D]
-
-        o_base = seq * stride_o_seq + head * stride_o_head
-        tl.store(qe_ptr + o_base + half_offs, qe[0, :])
-        tl.store(qo_ptr + o_base + half_offs, qo[0, :])
-
-    @triton.jit
-    def _tq_unrotate_output(
-        oe_ptr,       # [num_seqs, num_heads, HALF_D] f32 (even accum)
-        oo_ptr,       # [num_seqs, num_heads, HALF_D] f32 (odd accum)
-        rot_even_ptr, # [HALF_D, D] f32 — rotation[0::2, :]
-        rot_odd_ptr,  # [HALF_D, D] f32 — rotation[1::2, :]
-        out_ptr,      # [num_seqs, num_heads, D] bf16/f16 output
-        stride_o_seq, stride_o_head,
-        stride_r_row,
-        stride_out_seq, stride_out_head,
-        HALF_D: tl.constexpr,
-        D: tl.constexpr,
-    ):
-        """Fused: interleave even/odd + inverse rotate + cast to output dtype.
-
-        Grid: (num_heads, num_seqs)
-        output = acc_even @ rotation[0::2, :] + acc_odd @ rotation[1::2, :]
-        Uses tl.dot: [1, HALF_D] x [HALF_D, D] = [1, D]
-        """
-        head = tl.program_id(0)
-        seq = tl.program_id(1)
-
-        o_base = seq * stride_o_seq + head * stride_o_head
-        half_offs = tl.arange(0, HALF_D)
-        d_offs = tl.arange(0, D)
-
-        ae = tl.load(oe_ptr + o_base + half_offs)  # [HALF_D]
-        ao = tl.load(oo_ptr + o_base + half_offs)  # [HALF_D]
-
-        ae_mat = ae[None, :]  # [1, HALF_D]
-        ao_mat = ao[None, :]  # [1, HALF_D]
-
-        # Load pre-split rotation: [HALF_D, D]
-        re = tl.load(
-            rot_even_ptr
-            + half_offs[:, None] * stride_r_row
-            + d_offs[None, :])  # [HALF_D, D]
-        ro = tl.load(
-            rot_odd_ptr
-            + half_offs[:, None] * stride_r_row
-            + d_offs[None, :])  # [HALF_D, D]
-
-        # [1, HALF_D] x [HALF_D, D] = [1, D]
-        result = tl.dot(ae_mat, re) + tl.dot(ao_mat, ro)  # [1, D]
-
-        out_base = seq * stride_out_seq + head * stride_out_head
-        tl.store(out_ptr + out_base + d_offs, result[0, :])
 
     @triton.jit
     def _tq_paged_attn_fused_4bit(
@@ -662,13 +559,6 @@ class TQPagedAttention:
         """
         self.rotation = tq.rotation
         self.rotation_T = tq.rotation.T.contiguous()  # pre-transposed, contiguous
-        # Pre-split rotation matrices for fused Triton kernels
-        # rotation_T_even[:, k] = rotation_T[:, 2k]  (even columns)
-        self.rotation_T_even = tq.rotation.T[:, 0::2].contiguous()  # [D, HALF_D]
-        self.rotation_T_odd = tq.rotation.T[:, 1::2].contiguous()   # [D, HALF_D]
-        # rotation_even[k, :] = rotation[2k, :]  (even rows)
-        self.rotation_even = tq.rotation[0::2, :].contiguous()  # [HALF_D, D]
-        self.rotation_odd = tq.rotation[1::2, :].contiguous()   # [HALF_D, D]
         self.centroids = tq.centroids
         self.scale = 1.0 / math.sqrt(tq.head_dim)
         self.head_dim = tq.head_dim
@@ -770,6 +660,13 @@ class TQPagedAttention:
         q_even = q_rot[..., 0::2].contiguous()
         q_odd = q_rot[..., 1::2].contiguous()
 
+        # ── Step 1b: Block selection (sparse attention) ────────────
+        if self._block_selector is not None:
+            block_tables, context_lens = self._block_selector.select(
+                q_even, q_odd, block_tables, context_lens,
+                gqa_ratio, block_size)
+            max_blocks_per_seq = block_tables.shape[1]
+
         # Reuse output buffers across decode calls (shapes are fixed)
         out_shape = (num_seqs, num_q_heads, half_d)
         if self._out_even_buf is None or self._out_even_buf.shape != out_shape:
@@ -778,13 +675,6 @@ class TQPagedAttention:
             self._out_odd_buf = torch.empty_like(self._out_even_buf)
         out_even = self._out_even_buf
         out_odd = self._out_odd_buf
-
-        # ── Step 1b: Block selection (sparse attention) ────────────
-        if self._block_selector is not None:
-            block_tables, context_lens = self._block_selector.select(
-                q_even, q_odd, block_tables, context_lens,
-                gqa_ratio, block_size)
-            max_blocks_per_seq = block_tables.shape[1]
 
         # ── Step 2: Choose kernel based on context length ─────────
         use_splitk = max_blocks_per_seq >= self.SPLITK_THRESHOLD

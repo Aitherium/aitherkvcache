@@ -1,11 +1,13 @@
 # aither-kvcache
 
-Near-optimal KV cache quantization for LLM inference. Implements the TurboQuant
-algorithm from [Zandieh et al. (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874).
+Near-optimal KV cache compression for LLM inference. Two compression engines:
 
-Compresses KV cache vectors to 2-4 bits per value with MSE within 2.7x of
-the information-theoretic lower bound. No calibration data. No retraining.
-Works on streaming tokens.
+- **TurboQuant** — Vector quantization ([Zandieh et al., arXiv:2504.19874](https://arxiv.org/abs/2504.19874)).
+  2-4 bit, 3.8-7.1× compression vs FP16. No calibration data. Works on streaming tokens.
+
+- **TriAttention** *(NEW in v2.0)* — Spectral KV compression via trigonometric series.
+  Retains top RoPE frequency pairs, scores via trig series without materializing full K/V.
+  ~10× compression with bounded approximation error. Calibrated for Qwen3.5 family.
 
 ## Installation
 
@@ -16,7 +18,7 @@ pip install aither-kvcache[triton]    # + fused GPU kernels
 pip install aither-kvcache[all]       # everything
 ```
 
-## Quick Start
+## Quick Start — TurboQuant
 
 ```python
 from aither_kvcache import TurboQuant
@@ -26,6 +28,66 @@ tq = TurboQuant(head_dim=128, bits=4, device="cuda")
 packed, norms = tq.encode(kv_vectors)   # [..., 128] float16 -> [..., 64] uint8 + [...] f32
 decoded = tq.decode(packed, norms)       # [..., 64] uint8 + [...] f32 -> [..., 128] float16
 ```
+
+## Quick Start — TriAttention (v2.0+)
+
+```python
+from aither_kvcache.triattention import TriAttention, TriAttentionConfig
+
+# Configure: 12 frequency pairs, 4-bit coefficients → ~10× compression
+config = TriAttentionConfig(
+    head_dim=128, num_freqs=12, coeff_bits=4,
+    num_kv_heads=8, num_query_heads=32,
+    rope_base=1_000_000.0,       # Qwen3.5 RoPE base
+)
+tri = TriAttention(config, device="cuda")
+
+# Encode K/V to spectral representation (pre-RoPE keys)
+k_enc, v_enc = tri.encode_kv(keys, values)
+# keys: [B, S, num_kv_heads, head_dim] → spectral: 26 bytes/token vs 256 FP16
+
+# Decode: score via trig series, accumulate values
+output = tri.decode_step(query, k_enc, v_enc, query_pos, key_positions)
+```
+
+### Qwen3.5 calibration profiles
+
+```python
+from aither_kvcache.triattention.calibration import get_config_for_model
+
+config = get_config_for_model("Qwen3.5-8B", coeff_bits=4)
+# Per-layer frequency schedule: early layers get more frequencies,
+# middle layers are most spectrally concentrated.
+print(config.summary())
+# TriAttention Config (qwen3.5)
+#   head_dim=128, num_freqs=12, coeff_bits=4
+#   heads: 32Q / 8KV (GQA 4:1)
+#   storage: 26 bytes/token (vs 256 FP16)
+#   compression: 9.8× per K/V tensor
+```
+
+### How it works
+
+Transformer attention with RoPE is naturally a trigonometric series in position difference Δ = n − m:
+
+```
+score(q, k, m, n) = (1/√d) Σᵢ [cᵢ cos(Δθᵢ) + sᵢ sin(Δθᵢ)]
+```
+
+where `cᵢ = q₂ᵢk₂ᵢ + q₂ᵢ₊₁k₂ᵢ₊₁` (pair dot product) and `θᵢ = base^{-2i/d}` (RoPE frequency).
+
+Most key energy concentrates in a few frequency pairs. By retaining only the top-F pairs (by
+energy E_i = k₂ᵢ² + k₂ᵢ₊₁²) and quantizing coefficients to 4-bit, we store 26 bytes per token
+instead of 256 — a ~10× reduction with bounded approximation error.
+
+### TriAttention compression ratios
+
+| Mode | Coeff Bits | Bytes/Token | Compression vs FP16 |
+|------|-----------|-------------|---------------------|
+| F=12, int4 | 4 | 26 | **9.85×** |
+| F=12, int8 | 8 | 38 | 6.74× |
+| F=16, int4 | 4 | 34 | 7.53× |
+| F=8, int4 | 4 | 18 | **14.2×** |
 
 ## vLLM Integration
 

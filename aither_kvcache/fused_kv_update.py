@@ -114,7 +114,7 @@ if HAS_TRITON:
         # --- Step 3: compute L2 norm and normalize ---
         norm_sq = tl.sum(x_vec * x_vec)
         norm = tl.sqrt(norm_sq + 1e-20)
-        x_vec / norm
+        x_unit = x_vec / norm
 
         # --- Step 4: tiled rotation y = rotation @ x_unit ---
         # rotation is [HEAD_DIM, HEAD_DIM] stored row-major.
