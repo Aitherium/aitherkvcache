@@ -91,69 +91,88 @@ instead of 256 — a ~10× reduction with bounded approximation error.
 
 ## vLLM Integration
 
-Works with vLLM v0.15+ via the official plugin system. No monkey-patching.
+### Native kv-cache-dtype (recommended)
+
+With the [TQ-patched vLLM fork](https://github.com/Aitherium/aitherkvcache), TurboQuant is a **native KV cache dtype**.
+One flag, no hooks, no env vars:
+
+```bash
+vllm serve your-model --kv-cache-dtype tq-t4nc
+```
+
+Supported dtypes:
+
+| Dtype | Bits | Compression | Notes |
+|-------|------|------------|-------|
+| `tq-t4nc` | 4 | 3.8x | **Recommended** — best quality/compression tradeoff |
+| `tq-t3nc` | 3 | 4.9x | More aggressive |
+| `tq-t35nc` | 3.5 | 4.4x | Hybrid split-group quantization |
+| `tq-t2nc` | 2 | 7.1x | Maximum compression |
+
+Production Docker example:
+
+```yaml
+services:
+  vllm:
+    image: aither-vllm-tq:latest
+    command: >
+      python -m vllm.entrypoints.openai.api_server
+        --model your-model
+        --kv-cache-dtype tq-t4nc
+        --gpu-memory-utilization 0.85
+        --max-model-len 40960
+        --compilation-config '{"cudagraph_mode":"piecewise","max_cudagraph_capture_size":16}'
+        --max-num-seqs 16
+        --enable-prefix-caching
+```
+
+**Boundary layer protection**: First/last 2 layers auto-use FlashAttn (`auto`)
+to preserve embedding quality and output mixing.
+
+**Production results** (RTX 5090, Nemotron-8B-AWQ, `tq-t4nc`):
+
+| Metric | Value |
+|--------|-------|
+| KV cache | **250,928 tokens** (19.1 GiB) |
+| Max concurrency (40K ctx) | 6.1x simultaneous |
+| CUDA graphs | 10 piecewise, 6s capture |
+| Model load | 6.4 GiB, 15s |
+
+### Plugin mode (stock vLLM, v0.15+)
+
+For stock vLLM without the TQ fork:
 
 ```bash
 pip install aither-kvcache[vllm]
 vllm serve your-model --attention-backend CUSTOM
 ```
 
-The plugin auto-registers at startup in all vLLM processes (API server + engine workers)
-via Python entry points. It provides:
+### Hook-based integration (legacy, v0.9.1+)
 
-- **TurboQuantBackend**: registered as the `CUSTOM` attention backend
-- **TurboQuantImpl**: fused TQ decode (single-token) + standard Triton prefill (multi-token)
-- **TQGPUCache**: GPU-resident TQ-compressed KV storage with DDR5 cold tier (spill/warm)
-- **ColdTierCache**: Phase 1 fallback -- async background GPU-to-CPU TQ encode
-
-Decode reads directly from TQ-compressed GPU storage -- no decompression buffer.
-3.8x compression vs FP16 at 4-bit, up to 7.1x at 2-bit (1.9x vs FP8 at 4-bit).
-
-```bash
-# Env vars:
-AITHER_TQ_BITS=4              # 2, 3, or 4 (default: 4)
-AITHER_TQ_FUSED=1             # 1 = fused decode, 0 = standard fallback
-AITHER_TQ_EAGER=0             # 0 = torch.compile+CUDA graphs (recommended)
-AITHER_TQ_FORCE_TRITON=1      # Required on Blackwell (SM_100+)
-```
-
-**Validated**: RTX 5090 (Blackwell SM_120) -- 23.6 tok/s single-request, 120 tok/s 5x concurrent,
-27,541 KV blocks (3.8x vs FP8), 7/7 CUDA graphs captured. 174 unit tests + 38 integration tests.
-
-### Hook-based integration (v0.9.1+)
-
-For maximum performance with `torch.compile` + CUDA graphs, use the hook-based approach
-instead of the custom backend. This monkey-patches `TritonAttentionImpl.forward()` to
-intercept encode/decode without registering a custom backend (avoids Inductor corruption bugs):
+For older vLLM or when you need monkey-patching:
 
 ```python
-from aither_kvcache.vllm.hooks import apply_tq_hooks
+import os
+os.environ["AITHER_TQ_MODE"] = "tq4-primary"
+os.environ["AITHER_TQ_BITS"] = "4"
 
-# Call AFTER vLLM model is loaded:
-apply_tq_hooks()
+from aither_kvcache.vllm import apply_tq_patches, apply_tq_hooks
+apply_tq_patches(bits=4)   # BEFORE vLLM starts
+
+from vllm import LLM
+llm = LLM(model="your-model", gpu_memory_utilization=0.90)
+apply_tq_hooks()            # AFTER model loads
 ```
 
-The hook path merges encode + fused attention into a single `@torch.compiler.disable` call
-per layer, eliminating redundant graph breaks and CPU-GPU synchronization. Measured: **40 tok/s**
-single-request decode on RTX 5090, up from 11 tok/s with separate encode/decode calls.
+### Hybrid modes (tq35/tq25)
 
-```python
-# Or register the plugin-based backend:
-from aither_kvcache.vllm import register
-register()
-```
-
-### Hybrid modes (tq35/tq25) -- v1.0+
-
-Split-group quantization with QJL residual encoding. Better quality at the same
-compression ratio as uniform TQ:
+Split-group quantization with QJL residual encoding:
 
 ```python
 from aither_kvcache import HybridTurboQuant
-
 htq = HybridTurboQuant(head_dim=128, mode="tq35", device="cuda")
 htq.calibrate_uniform()
-packed = htq.encode(kv_vectors)   # single tensor, norms embedded
+packed = htq.encode(kv_vectors)
 decoded = htq.decode(packed)
 ```
 
@@ -162,44 +181,10 @@ decoded = htq.decode(packed)
 | tq35 | 3.5 | 50% dims @ 4-bit + 50% @ 3-bit (MSE + QJL) |
 | tq25 | 2.5 | 25% dims @ 3-bit + 75% @ 2-bit (MSE + QJL) |
 
-### PRIMARY mode -- TQ IS the KV cache
+### Zero graph breaks (v1.0+)
 
-Instead of maintaining a shadow copy, PRIMARY mode patches vLLM to allocate
-TQ-compressed blocks directly. 3.8x more blocks for the same VRAM budget:
-
-```bash
-export AITHER_TQ_MODE=tq4-primary
-export AITHER_TQ_BITS=4
-```
-
-Requires engine patches + hook-based integration:
-
-```python
-from aither_kvcache.vllm.engine import apply_tq_patches
-from aither_kvcache.vllm.hooks import apply_tq_hooks
-
-apply_tq_patches(bits=4)  # Before vLLM starts
-apply_tq_hooks()           # After model loads
-```
-
-Or use the provided sitecustomize hook for automatic patching:
-
-```bash
-cp $(python -c "from aither_kvcache.vllm import sitecustomize; print(sitecustomize.__file__)") /path/to/sitecustomize.py
-export PYTHONPATH="/path/to:$PYTHONPATH"
-vllm serve your-model --attention-backend TRITON_ATTN --compilation-config '{"cudagraph_mode":"piecewise"}'
-```
-
-### Zero graph breaks -- full CUDA graph support (v1.0+)
-
-All modes now register `torch.library.custom_op` for zero-graph-break decode:
-
-| Mode | Custom Op | Decode Strategy |
-|------|-----------|----------------|
-| tq4/tq3/tq2 | `tq::decode_step` | Fused rotated-domain Triton attention |
-| tq35/tq25 | `tq::hybrid_decode_step` | Clamp-gather decompress + masked SDPA |
-
-Requires PyTorch 2.4+. Falls back to `@torch.compiler.disable` graph breaks on older PyTorch.
+All modes register `torch.library.custom_op` for zero-graph-break decode.
+Requires PyTorch 2.4+. Falls back to `@torch.compiler.disable` on older versions.
 
 ## Where This Fits
 
@@ -525,11 +510,14 @@ CC BY 4.0
 
 ## vLLM Integration (upstream)
 
-Native vLLM integration is in progress via [PR #39008](https://github.com/vllm-project/vllm/pull/39008):
+Native integration via [TQ-patched fork](https://github.com/Aitherium/aitherkvcache).
+Upstream PR: [vllm-project/vllm#39008](https://github.com/vllm-project/vllm/pull/39008).
 
 ```bash
-# Once merged:
-vllm serve your-model --kv-cache-dtype tq4
-```
+# TQ fork (works now):
+vllm serve your-model --kv-cache-dtype tq-t4nc
 
-Until then, use the hook-based or plugin-based integration from this package (see above).
+# Stock vLLM (plugin mode):
+pip install aither-kvcache[vllm]
+vllm serve your-model --attention-backend CUSTOM
+```

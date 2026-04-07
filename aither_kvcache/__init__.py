@@ -56,4 +56,4 @@ __all__ = [
     # TriAttention — lazy-loaded via subpackage
     # from aither_kvcache.triattention import TriAttention, TriAttentionConfig
 ]
-__version__ = "2.0.0"
+__version__ = "2.0.1"

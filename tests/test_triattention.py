@@ -29,6 +29,10 @@ from aither_kvcache.triattention.cache import SpectralKVCache
 from aither_kvcache.triattention.attention import TriAttention, _apply_rope
 from aither_kvcache.triattention.calibration import (
     QWEN3_5_PROFILES,
+    NEMOTRON_PROFILES,
+    DEEPSEEK_PROFILES,
+    LLAMA_PROFILES,
+    ALL_PROFILES,
     get_profile,
     get_config_for_model,
 )
@@ -370,6 +374,78 @@ class TestCalibration:
     def test_early_layers_more_freqs(self):
         p = get_profile("8B")
         assert p.layer_profiles[0].recommended_freqs >= p.layer_profiles[18].recommended_freqs
+
+    def test_all_profiles_registry(self):
+        assert len(ALL_PROFILES) >= 13
+        families = {p.model_family for p in ALL_PROFILES.values()}
+        assert "qwen3.5" in families
+        assert "qwen3" in families
+        assert "qwen2" in families
+        assert "llama3.1" in families
+
+    def test_nemotron_profile(self):
+        p = get_profile("nvidia/Nemotron-Orchestrator-8B")
+        assert p is not None
+        assert p.model_name == "Nemotron-Orchestrator-8B"
+        assert p.model_family == "qwen3"
+        assert p.num_layers == 36
+        assert p.num_kv_heads == 8
+        assert p.num_query_heads == 32
+        assert p.rope_base == 1_000_000.0
+
+    def test_nemotron_aliases(self):
+        for alias in [
+            "Nemotron-Orchestrator-8B",
+            "nvidia/Nemotron-Orchestrator-8B",
+            "cyankiwi/Nemotron-Orchestrator-8B-AWQ-4bit",
+            "aither-orchestrator",
+        ]:
+            p = get_profile(alias)
+            assert p is not None, f"Alias '{alias}' should resolve"
+            assert p.model_name == "Nemotron-Orchestrator-8B"
+
+    def test_nemotron_config_compression(self):
+        cfg = get_config_for_model("nvidia/Nemotron-Orchestrator-8B")
+        assert cfg.compression_ratio >= 9.0  # ~9.85x at F=12, int4
+        assert cfg.model_family == "qwen3"
+
+    def test_deepseek_r1_14b_profile(self):
+        p = get_profile("deepseek-r1:14b")
+        assert p is not None
+        assert p.model_family == "qwen2"
+        assert p.num_layers == 48
+        assert p.num_query_heads == 40
+
+    def test_deepseek_r1_aliases(self):
+        for alias in [
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+            "casperhansen/deepseek-r1-distill-qwen-14b-awq",
+            "deepseek-r1:14b",
+        ]:
+            p = get_profile(alias)
+            assert p is not None, f"Alias '{alias}' should resolve"
+
+    def test_llama_profile(self):
+        p = get_profile("Llama-3.1-8B")
+        assert p is not None
+        assert p.model_family == "llama3.1"
+        assert p.rope_base == 500_000.0
+        assert p.num_layers == 32
+
+    def test_llama_alias(self):
+        p = get_profile("meta-llama/Llama-3.1-8B-Instruct")
+        assert p is not None
+        assert p.model_name == "Llama-3.1-8B"
+
+    def test_unknown_model_fallback(self):
+        cfg = get_config_for_model("totally-unknown-model-42B")
+        assert cfg.model_family == "generic"
+
+    def test_all_profiles_generate_valid_config(self):
+        for name, profile in ALL_PROFILES.items():
+            cfg = profile.to_config()
+            assert cfg.compression_ratio > 1.0, f"{name} should compress"
+            assert len(cfg.layer_freq_schedule) == profile.num_layers
 
 
 # ── Integration ───────────────────────────────────────────────────

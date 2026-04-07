@@ -15,7 +15,7 @@ Profiles are conservative defaults; run `spectral_profile_sweep()` on
 your own data for optimal per-layer tuning.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from .config import TriAttentionConfig
@@ -41,6 +41,8 @@ class ModelProfile:
     rope_base: float
     default_freqs: int
     layer_profiles: List[LayerProfile]
+    model_family: str = "generic"
+    aliases: List[str] = field(default_factory=list)
 
     def to_config(self, **overrides) -> TriAttentionConfig:
         """Convert this profile to a TriAttentionConfig."""
@@ -51,7 +53,7 @@ class ModelProfile:
             num_kv_heads=self.num_kv_heads,
             num_query_heads=self.num_query_heads,
             rope_base=self.rope_base,
-            model_family="qwen3.5",
+            model_family=self.model_family,
             layer_freq_schedule=schedule,
         )
         kwargs.update(overrides)
@@ -117,6 +119,7 @@ QWEN3_5_PROFILES: Dict[str, ModelProfile] = {
         rope_base=1_000_000.0,
         default_freqs=14,
         layer_profiles=_make_layer_schedule(28, 14, early_extra=4, late_extra=2),
+        model_family="qwen3.5",
     ),
     "Qwen3.5-1.7B": ModelProfile(
         model_name="Qwen3.5-1.7B",
@@ -127,6 +130,7 @@ QWEN3_5_PROFILES: Dict[str, ModelProfile] = {
         rope_base=1_000_000.0,
         default_freqs=12,
         layer_profiles=_make_layer_schedule(28, 12, early_extra=4, late_extra=2),
+        model_family="qwen3.5",
     ),
     "Qwen3.5-4B": ModelProfile(
         model_name="Qwen3.5-4B",
@@ -137,6 +141,7 @@ QWEN3_5_PROFILES: Dict[str, ModelProfile] = {
         rope_base=1_000_000.0,
         default_freqs=12,
         layer_profiles=_make_layer_schedule(36, 12, early_extra=6, late_extra=3),
+        model_family="qwen3.5",
     ),
     "Qwen3.5-8B": ModelProfile(
         model_name="Qwen3.5-8B",
@@ -147,6 +152,7 @@ QWEN3_5_PROFILES: Dict[str, ModelProfile] = {
         rope_base=1_000_000.0,
         default_freqs=12,
         layer_profiles=_make_layer_schedule(36, 12, early_extra=6, late_extra=3),
+        model_family="qwen3.5",
     ),
     "Qwen3.5-14B": ModelProfile(
         model_name="Qwen3.5-14B",
@@ -157,6 +163,7 @@ QWEN3_5_PROFILES: Dict[str, ModelProfile] = {
         rope_base=1_000_000.0,
         default_freqs=10,
         layer_profiles=_make_layer_schedule(48, 10, early_extra=6, late_extra=4),
+        model_family="qwen3.5",
     ),
     "Qwen3.5-32B": ModelProfile(
         model_name="Qwen3.5-32B",
@@ -167,6 +174,7 @@ QWEN3_5_PROFILES: Dict[str, ModelProfile] = {
         rope_base=1_000_000.0,
         default_freqs=10,
         layer_profiles=_make_layer_schedule(64, 10, early_extra=8, late_extra=4),
+        model_family="qwen3.5",
     ),
     "Qwen3.5-30B-A3B": ModelProfile(
         model_name="Qwen3.5-30B-A3B",
@@ -177,23 +185,177 @@ QWEN3_5_PROFILES: Dict[str, ModelProfile] = {
         rope_base=1_000_000.0,
         default_freqs=12,
         layer_profiles=_make_layer_schedule(48, 12, early_extra=6, late_extra=3),
+        model_family="qwen3.5",
     ),
+}
+
+
+# ============================================================================
+# NVIDIA NEMOTRON PROFILES (Qwen3 architecture)
+# ============================================================================
+
+NEMOTRON_PROFILES: Dict[str, ModelProfile] = {
+    "Nemotron-Orchestrator-8B": ModelProfile(
+        model_name="Nemotron-Orchestrator-8B",
+        head_dim=128,
+        num_layers=36,
+        num_kv_heads=8,
+        num_query_heads=32,
+        rope_base=1_000_000.0,
+        default_freqs=12,
+        layer_profiles=_make_layer_schedule(36, 12, early_extra=6, late_extra=3),
+        model_family="qwen3",
+        aliases=[
+            "nvidia/Nemotron-Orchestrator-8B",
+            "cyankiwi/Nemotron-Orchestrator-8B-AWQ-4bit",
+            "Nemotron-Orchestrator-8B-AWQ",
+            "aither-orchestrator",
+            "aither-orchestrator-8b",
+        ],
+    ),
+}
+
+
+# ============================================================================
+# DEEPSEEK-R1 DISTILL PROFILES (Qwen2 architecture)
+# ============================================================================
+
+DEEPSEEK_PROFILES: Dict[str, ModelProfile] = {
+    "DeepSeek-R1-Distill-Qwen-14B": ModelProfile(
+        model_name="DeepSeek-R1-Distill-Qwen-14B",
+        head_dim=128,
+        num_layers=48,
+        num_kv_heads=8,
+        num_query_heads=40,
+        rope_base=1_000_000.0,
+        default_freqs=10,
+        layer_profiles=_make_layer_schedule(48, 10, early_extra=6, late_extra=4),
+        model_family="qwen2",
+        aliases=[
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+            "casperhansen/deepseek-r1-distill-qwen-14b-awq",
+            "deepseek-r1:14b",
+        ],
+    ),
+    "DeepSeek-R1-Distill-Qwen-7B": ModelProfile(
+        model_name="DeepSeek-R1-Distill-Qwen-7B",
+        head_dim=128,
+        num_layers=28,
+        num_kv_heads=4,
+        num_query_heads=28,
+        rope_base=1_000_000.0,
+        default_freqs=12,
+        layer_profiles=_make_layer_schedule(28, 12, early_extra=4, late_extra=2),
+        model_family="qwen2",
+        aliases=[
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+            "deepseek-r1:7b",
+        ],
+    ),
+    "DeepSeek-R1-Distill-Qwen-32B": ModelProfile(
+        model_name="DeepSeek-R1-Distill-Qwen-32B",
+        head_dim=128,
+        num_layers=64,
+        num_kv_heads=8,
+        num_query_heads=64,
+        rope_base=1_000_000.0,
+        default_freqs=10,
+        layer_profiles=_make_layer_schedule(64, 10, early_extra=8, late_extra=4),
+        model_family="qwen2",
+        aliases=[
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+            "deepseek-r1:32b",
+        ],
+    ),
+}
+
+
+# ============================================================================
+# LLAMA 3.1 PROFILES (rope_base=500000)
+# ============================================================================
+
+LLAMA_PROFILES: Dict[str, ModelProfile] = {
+    "Llama-3.1-8B": ModelProfile(
+        model_name="Llama-3.1-8B",
+        head_dim=128,
+        num_layers=32,
+        num_kv_heads=8,
+        num_query_heads=32,
+        rope_base=500_000.0,
+        default_freqs=12,
+        layer_profiles=_make_layer_schedule(32, 12, early_extra=4, late_extra=3),
+        model_family="llama3.1",
+        aliases=[
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "meta-llama/Meta-Llama-3.1-8B",
+        ],
+    ),
+    "Llama-3.1-70B": ModelProfile(
+        model_name="Llama-3.1-70B",
+        head_dim=128,
+        num_layers=80,
+        num_kv_heads=8,
+        num_query_heads=64,
+        rope_base=500_000.0,
+        default_freqs=10,
+        layer_profiles=_make_layer_schedule(80, 10, early_extra=8, late_extra=4),
+        model_family="llama3.1",
+        aliases=[
+            "meta-llama/Llama-3.1-70B-Instruct",
+            "meta-llama/Meta-Llama-3.1-70B",
+        ],
+    ),
+}
+
+
+# ============================================================================
+# UNIFIED REGISTRY
+# ============================================================================
+
+ALL_PROFILES: Dict[str, ModelProfile] = {
+    **QWEN3_5_PROFILES,
+    **NEMOTRON_PROFILES,
+    **DEEPSEEK_PROFILES,
+    **LLAMA_PROFILES,
 }
 
 
 def get_profile(model_name: str) -> Optional[ModelProfile]:
     """Look up a calibration profile by model name.
 
-    Supports partial matching (e.g., "8B" matches "Qwen3.5-8B").
+    Search order:
+      1. Exact key match in ALL_PROFILES
+      2. Exact alias match (case-insensitive)
+      3. Partial/substring match on profile keys and aliases
+
+    Examples::
+
+        get_profile("Qwen3.5-8B")                              # exact key
+        get_profile("nvidia/Nemotron-Orchestrator-8B")          # alias
+        get_profile("deepseek-r1:14b")                          # alias
+        get_profile("Nemotron")                                 # partial
+        get_profile("Llama-3.1-8B")                             # exact key
     """
-    # Exact match first
-    if model_name in QWEN3_5_PROFILES:
-        return QWEN3_5_PROFILES[model_name]
-    # Partial match
+    # 1. Exact key match
+    if model_name in ALL_PROFILES:
+        return ALL_PROFILES[model_name]
+
     model_lower = model_name.lower()
-    for name, profile in QWEN3_5_PROFILES.items():
+
+    # 2. Exact alias match (case-insensitive)
+    for profile in ALL_PROFILES.values():
+        for alias in profile.aliases:
+            if model_lower == alias.lower():
+                return profile
+
+    # 3. Partial / substring match on keys + aliases
+    for name, profile in ALL_PROFILES.items():
         if model_lower in name.lower() or name.lower() in model_lower:
             return profile
+        for alias in profile.aliases:
+            if model_lower in alias.lower() or alias.lower() in model_lower:
+                return profile
+
     return None
 
 

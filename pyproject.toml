@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aither-kvcache"
-version = "2.0.0"
+version = "2.0.1"
 description = "Near-optimal KV cache compression for LLM inference — TurboQuant (vector quantization) + TriAttention (spectral compression)"
 readme = "README.md"
 license = "CC-BY-4.0"
