@@ -133,6 +133,27 @@ def _tq_dim_for_head(head_size: int) -> int:
         return packed_size(head_size, _TQ_BITS) + 4
 
 
+def _align_page_size(raw_bytes: int) -> int:
+    """Round page size up to the next power of 2 for cross-layer divisibility.
+
+    vLLM's unify_kv_cache_spec_page_size() requires all layer page sizes to be
+    divisible by the max page size. With heterogeneous head dims (e.g. Gemma 4:
+    256 + 512), the smaller layers produce page sizes that don't divide the
+    larger ones. Padding to next power-of-2 ensures any layer's padded page
+    size divides any other's (both are powers of 2 -> larger divides by smaller).
+
+    For uniform models, this is a no-op if page size is already a power of 2,
+    and at worst wastes a few bytes per block (acceptable for correctness).
+    """
+    if raw_bytes <= 0:
+        return raw_bytes
+    # Next power of 2 >= raw_bytes
+    p = 1
+    while p < raw_bytes:
+        p <<= 1
+    return p
+
+
 def _patch_page_size() -> bool:
     """
     Patch real_page_size_bytes on both AttentionSpec and FullAttentionSpec.
@@ -148,8 +169,11 @@ def _patch_page_size() -> bool:
 
     @property
     def _tq_real_page_size_bytes(self):
-        """Return TQ-compressed page size (handles both uniform and hybrid)."""
-        return _tq_page_size_bytes(self.block_size, self.num_kv_heads, self.head_size)
+        """Return TQ-compressed page size (handles both uniform and hybrid).
+        Pads to ensure cross-layer divisibility for heterogeneous head dims
+        (e.g. Gemma 4: head_dim=256 local + head_dim=512 global)."""
+        raw = _tq_page_size_bytes(self.block_size, self.num_kv_heads, self.head_size)
+        return _align_page_size(raw)
 
     # Patch BOTH classes -- FullAttentionSpec shadows parent's property
     AttentionSpec.real_page_size_bytes = _tq_real_page_size_bytes

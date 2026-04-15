@@ -306,7 +306,7 @@ def _make_backend_class():
 
         @staticmethod
         def get_supported_head_sizes():
-            return [64, 96, 128, 256]
+            return [64, 96, 128, 256, 512]
 
     return TurboQuantBackend
 

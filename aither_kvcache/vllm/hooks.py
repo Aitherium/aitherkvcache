@@ -29,7 +29,7 @@ Set AITHER_TQ_DEBUG_STEPS=N to log the first N forward calls per layer-0
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -83,8 +83,9 @@ _hooks_applied = False
 _original_forward = None  # Saved reference to TritonAttentionImpl.forward
 
 # TQ state shared across all layers (class-level in the patched impl)
-_tq_quantizer: Optional[object] = None
-_tq_packed_dim: int = 0     # packed bytes per head (derived from quantizer)
+# Per-head-dim quantizers for heterogeneous models (e.g. Gemma 4: 256 + 512)
+_tq_quantizers: Dict[int, object] = {}    # head_dim -> TurboQuant instance
+_tq_packed_dims: Dict[int, int] = {}      # head_dim -> packed bytes per head
 _tq_fused_attn: dict = {}   # layer_idx -> TQPagedAttention instance
 _primary_k_norms: Optional[torch.Tensor] = None  # None for hybrid (norms embedded)
 _primary_v_norms: Optional[torch.Tensor] = None
@@ -95,6 +96,18 @@ _num_layers = 0
 _prefill_k_buf: Optional[torch.Tensor] = None
 _prefill_v_buf: Optional[torch.Tensor] = None
 _PREFILL_BUF_BLOCKS = 512
+
+def _get_tq(head_size: int) -> Tuple[object, int]:
+    """Get quantizer and packed_dim for a given head_size."""
+    return _tq_quantizers[head_size], _tq_packed_dims[head_size]
+
+
+def _any_tq() -> Optional[object]:
+    """Get any initialized quantizer (for operations that don't care about head_dim)."""
+    if _tq_quantizers:
+        return next(iter(_tq_quantizers.values()))
+    return None
+
 
 # Custom op flag -- set by _register_custom_ops()
 _USE_CUSTOM_OP = False
@@ -135,10 +148,9 @@ def _register_custom_ops():
             num_actual: int,
         ) -> torch.Tensor:
             """Encode new token + fused TQ attention. No graph break.
-            Accesses module globals (_tq_quantizer, _tq_fused_attn) in body --
+            Accesses module globals (_tq_quantizers, _tq_fused_attn) in body --
             these are initialized during vLLM warmup before CUDA graph capture."""
-            tq = _tq_quantizer
-            packed_dim = head_size // 2
+            tq, packed_dim = _get_tq(head_size)
             key_cache = kv_cache[:, 0]
             value_cache = kv_cache[:, 1]
             block_size = key_cache.shape[1]
@@ -260,8 +272,7 @@ def _register_hybrid_custom_ops():
             """
             global _hybrid_dk_buf, _hybrid_dv_buf
 
-            tq = _tq_quantizer
-            packed_dim = _tq_packed_dim
+            tq, packed_dim = _get_tq(head_size)
             key_cache = kv_cache[:, 0]
             value_cache = kv_cache[:, 1]
             block_size = key_cache.shape[1]
@@ -369,32 +380,38 @@ def _tq_init_layer(self_impl):
 
 @torch.compiler.disable
 def _ensure_quantizer(device, head_size, num_heads, num_kv_heads):
-    """Lazy-init TQ quantizer and fused attention on first real forward."""
-    global _tq_quantizer, _tq_packed_dim, _num_layers
-    if _tq_quantizer is not None:
-        return
+    """Lazy-init TQ quantizer for a given head_size. Creates/caches per unique head_dim.
+    Supports heterogeneous head dimensions (e.g. Gemma 4: 256 local + 512 global)."""
+    global _num_layers
+    if head_size in _tq_quantizers:
+        return  # Already initialized for this head_dim
 
-    _num_layers = _layer_counter
+    if not _tq_quantizers:  # First quantizer -- snapshot layer count
+        _num_layers = _layer_counter
 
     if _TQ_IS_HYBRID:
         from ..hybrid_quantizer import HybridTurboQuant
-        _tq_quantizer = HybridTurboQuant(
+        tq = HybridTurboQuant(
             head_dim=head_size, mode=_TQ_MODE, device=str(device),
             num_kv_heads=num_kv_heads)
-        _tq_quantizer.calibrate_uniform()
-        _tq_packed_dim = _tq_quantizer.layout.packed_dim
+        tq.calibrate_uniform()
+        pd = tq.layout.packed_dim
+        _tq_quantizers[head_size] = tq
+        _tq_packed_dims[head_size] = pd
         logger.info("TQ hybrid quantizer initialized: head_dim=%d, mode=%s, "
-                    "packed_dim=%d, %d layers",
-                    head_size, _TQ_MODE, _tq_packed_dim, _num_layers)
+                    "packed_dim=%d, %d layers (total quantizers: %d)",
+                    head_size, _TQ_MODE, pd, _num_layers, len(_tq_quantizers))
     else:
         from ..quantizer import TurboQuant
         from ..packing import packed_size
-        _tq_quantizer = TurboQuant(
+        tq = TurboQuant(
             head_dim=head_size, bits=_TQ_BITS, device=str(device))
-        _tq_packed_dim = packed_size(head_size, _TQ_BITS)
+        pd = packed_size(head_size, _TQ_BITS)
+        _tq_quantizers[head_size] = tq
+        _tq_packed_dims[head_size] = pd
         logger.info("TQ quantizer initialized: head_dim=%d, bits=%d, "
-                    "packed_dim=%d, %d layers",
-                    head_size, _TQ_BITS, _tq_packed_dim, _num_layers)
+                    "packed_dim=%d, %d layers (total quantizers: %d)",
+                    head_size, _TQ_BITS, pd, _num_layers, len(_tq_quantizers))
 
 
 @torch.compiler.disable
@@ -420,12 +437,11 @@ def _ensure_norms(num_layers, num_blocks, block_size, num_kv_heads, device):
 def _tq_encode_phase(layer_idx, key, value, kv_cache, slot_mapping):
     """Encode new K,V tokens into TQ primary cache. Runs eagerly.
     Supports both uniform (separate norms) and hybrid (norms embedded) modes."""
-    global _tq_quantizer, _primary_k_norms, _primary_v_norms
-    tq = _tq_quantizer
-    if tq is None:
+    global _primary_k_norms, _primary_v_norms
+    head_size = key.shape[-1]
+    if head_size not in _tq_quantizers:
         return
-
-    packed_dim = _tq_packed_dim
+    tq, packed_dim = _get_tq(head_size)
 
     key_cache = kv_cache[:, 0]    # [blocks, block_size, kv_heads, tq_dim]
     value_cache = kv_cache[:, 1]
@@ -508,18 +524,17 @@ def _tq_decompress_active(layer_idx, kv_cache, block_table, num_kv_heads,
     """Decompress active TQ blocks into a temporary fp8/bf16 buffer.
     Returns a standard-shaped kv_cache tensor for TritonAttention.
     Runs eagerly."""
-    global _tq_quantizer, _primary_k_norms, _primary_v_norms
+    global _primary_k_norms, _primary_v_norms
     global _prefill_k_buf, _prefill_v_buf
 
-    tq = _tq_quantizer
-    if tq is None:
+    if head_size not in _tq_quantizers:
         return kv_cache  # Fallback: return original (will fail but shouldn't happen)
+    tq, packed_dim = _get_tq(head_size)
 
     key_cache = kv_cache[:, 0]
     value_cache = kv_cache[:, 1]
     num_blocks = key_cache.shape[0]
     block_size = key_cache.shape[1]
-    packed_dim = head_size // 2
 
     # Allocate or reuse decompress buffers
     need_realloc = (
@@ -576,15 +591,16 @@ def _tq_fused_decode(layer_idx, query, kv_cache, attn_metadata, output,
                      num_heads, num_kv_heads, head_size, scale):
     """Fused TQ decode using TQPagedAttention kernel. No decompress needed.
     Runs eagerly (graph break)."""
-    global _tq_fused_attn, _tq_quantizer, _primary_k_norms, _primary_v_norms
+    global _tq_fused_attn, _primary_k_norms, _primary_v_norms
+
+    tq, packed_dim = _get_tq(head_size)
 
     # Lazy-init fused attention for this layer
     if layer_idx not in _tq_fused_attn:
         from ..fused_attention import TQPagedAttention
-        _tq_fused_attn[layer_idx] = TQPagedAttention(_tq_quantizer, num_heads)
+        _tq_fused_attn[layer_idx] = TQPagedAttention(tq, num_heads)
 
     fused = _tq_fused_attn[layer_idx]
-    packed_dim = head_size // 2
 
     key_cache = kv_cache[:, 0]
     value_cache = kv_cache[:, 1]
@@ -609,8 +625,7 @@ def _encode_inline(layer_idx, key, value, kv_cache, slot_mapping):
     """Encode K/V into TQ cache. No decorator -- called from _tq_decode_step.
     Branchless for decode: no .any() CPU-GPU syncs. Works for any N tokens.
     Supports both uniform and hybrid modes."""
-    tq = _tq_quantizer
-    packed_dim = _tq_packed_dim
+    tq, packed_dim = _get_tq(key.shape[-1])
     key_cache = kv_cache[:, 0]
     value_cache = kv_cache[:, 1]
     block_size = key_cache.shape[1]
@@ -658,14 +673,14 @@ def _tq_decode_step(layer_idx, query, key, value, kv_cache, attn_metadata,
         _encode_inline(layer_idx, key, value, kv_cache,
                        attn_metadata.slot_mapping)
 
+    tq, packed_dim = _get_tq(head_size)
+
     # Fused attention -- dict lookup for cached TQPagedAttention
     fused = _tq_fused_attn.get(layer_idx)
     if fused is None:
         from ..fused_attention import TQPagedAttention
-        fused = TQPagedAttention(_tq_quantizer, num_heads)
+        fused = TQPagedAttention(tq, num_heads)
         _tq_fused_attn[layer_idx] = fused
-
-    packed_dim = _tq_packed_dim
     key_cache = kv_cache[:, 0]
     value_cache = kv_cache[:, 1]
 
@@ -715,7 +730,12 @@ def _tq_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
     Manual GQA expansion. is_causal=True for prefill, is_causal=False for decode
     (single query attends to all prior positions -- no mask needed)."""
     import torch.nn.functional as F
-    global _tq_quantizer, _primary_k_norms, _primary_v_norms
+    global _primary_k_norms, _primary_v_norms
+
+    if head_size not in _tq_quantizers:
+        output.fill_(0)
+        return output
+    tq_inst, packed_dim = _get_tq(head_size)
 
     num_actual = attn_metadata.num_actual_tokens
     cu_seqlens = attn_metadata.query_start_loc
@@ -729,7 +749,6 @@ def _tq_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
     key_cache = kv_cache[:, 0]
     value_cache = kv_cache[:, 1]
     block_size = key_cache.shape[1]
-    packed_dim = _tq_packed_dim
     block_table = attn_metadata.block_table
 
     for i in range(num_seqs):
@@ -746,7 +765,7 @@ def _tq_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
             # First prefill: all context is in current K/V
             ki = k_raw[q_start:q_end]
             vi = v_raw[q_start:q_end]
-        elif k_raw is not None and _tq_quantizer is not None:
+        elif k_raw is not None and tq_inst is not None:
             # Continuation: decompress prior blocks + append current
             prior_len = ctx_len - q_len
             prior_blocks = (prior_len + block_size - 1) // block_size
@@ -754,7 +773,7 @@ def _tq_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
             bt = bt[bt >= 0]
 
             if bt.numel() > 0:
-                tq = _tq_quantizer
+                tq = tq_inst
                 H = num_kv_heads
 
                 kp = key_cache[bt, :, :, :packed_dim]
@@ -843,7 +862,7 @@ def _make_tq_forward(original_fwd):
         # Runs during BOTH normal execution AND CUDA graph capture.
         # Falls through to slow path for: init, prefill, missing key/value.
         if (hasattr(self, '_tq_layer_idx')
-                and _tq_quantizer is not None
+                and self.head_size in _tq_quantizers
                 and attn_metadata is not None
                 and output is not None
                 and key is not None and value is not None
@@ -892,7 +911,7 @@ def _make_tq_forward(original_fwd):
                 output_block_scale=output_block_scale)
 
         # --- Init quantizer + norms (guarded: no graph break after first call) ---
-        if _tq_quantizer is None:
+        if self.head_size not in _tq_quantizers:
             _ensure_quantizer(query.device, self.head_size,
                              self.num_heads, self.num_kv_heads)
         if not _TQ_IS_HYBRID and _primary_k_norms is None:
@@ -946,7 +965,7 @@ def _make_tq_forward(original_fwd):
         # --- Phase 2a: Decode (fused TQ attention for uniform, custom op for hybrid) ---
         # Hybrid mode uses tq::hybrid_decode_step custom op (zero graph breaks),
         # or falls through to encode+SDPA path if custom op not available.
-        if is_decode and _tq_quantizer is not None and _TQ_IS_HYBRID:
+        if is_decode and self.head_size in _tq_quantizers and _TQ_IS_HYBRID:
             if _USE_HYBRID_CUSTOM_OP and key is not None and value is not None:
                 num_actual = attn_metadata.num_actual_tokens
                 try:
@@ -965,7 +984,7 @@ def _make_tq_forward(original_fwd):
                                  self._tq_layer_idx, e)
                     # Fall through to graph-break SDPA
 
-        if is_decode and _tq_quantizer is not None and not _TQ_IS_HYBRID:
+        if is_decode and self.head_size in _tq_quantizers and not _TQ_IS_HYBRID:
             num_actual = attn_metadata.num_actual_tokens
             try:
                 if _TQ_DEBUG and self._tq_layer_idx == 0:
@@ -1119,8 +1138,7 @@ def _debug_prefill_sdpa(layer_idx, query, key, value, kv_cache, attn_metadata,
                           file=sys.stderr, flush=True)
 
                 # Decode first few vectors and check
-                tq = _tq_quantizer
-                packed_dim = _tq_packed_dim
+                tq, packed_dim = _get_tq(head_size)
                 kc = kv_cache[:, 0]
                 kp0 = kc[block_ids[0], 0, 0, :packed_dim]  # first slot, first head
                 kn0 = _primary_k_norms[0, block_ids[0], 0, 0]  # first slot, first head
