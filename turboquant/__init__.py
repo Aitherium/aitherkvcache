@@ -22,6 +22,7 @@ Usage:
 """
 
 from .quantizer import TurboQuant, TurboQuantConfig
+from .gb10_fp8_rescue import get_gb10_fp8_status, install_gb10_fp8_rescue
 
 __all__ = [
     "TurboQuant",
@@ -34,6 +35,8 @@ __all__ = [
     "get_tier_cache_bridge",
     "get_strata_cache_shadow",
     "get_graph_eviction_advisor",
+    "install_gb10_fp8_rescue",
+    "get_gb10_fp8_status",
 ]
 __version__ = "0.9.0"
 
