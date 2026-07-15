@@ -178,7 +178,7 @@ def _register_custom_ops():
             # Fused attention (lazy-init persists across CUDA graph replay)
             fused = _tq_fused_attn.get(layer_idx)
             if fused is None:
-                from ..fused_attention import TQPagedAttention
+                from turboquant.fused_attention import TQPagedAttention
                 fused = TQPagedAttention(tq, num_heads)
                 _tq_fused_attn[layer_idx] = fused
 
@@ -402,8 +402,8 @@ def _ensure_quantizer(device, head_size, num_heads, num_kv_heads):
                     "packed_dim=%d, %d layers (total quantizers: %d)",
                     head_size, _TQ_MODE, pd, _num_layers, len(_tq_quantizers))
     else:
-        from ..quantizer import TurboQuant
-        from ..packing import packed_size
+        from turboquant import TurboQuant
+        from turboquant.packing import packed_size
         tq = TurboQuant(
             head_dim=head_size, bits=_TQ_BITS, device=str(device))
         pd = packed_size(head_size, _TQ_BITS)
@@ -597,7 +597,7 @@ def _tq_fused_decode(layer_idx, query, kv_cache, attn_metadata, output,
 
     # Lazy-init fused attention for this layer
     if layer_idx not in _tq_fused_attn:
-        from ..fused_attention import TQPagedAttention
+        from turboquant.fused_attention import TQPagedAttention
         _tq_fused_attn[layer_idx] = TQPagedAttention(tq, num_heads)
 
     fused = _tq_fused_attn[layer_idx]
@@ -678,7 +678,7 @@ def _tq_decode_step(layer_idx, query, key, value, kv_cache, attn_metadata,
     # Fused attention -- dict lookup for cached TQPagedAttention
     fused = _tq_fused_attn.get(layer_idx)
     if fused is None:
-        from ..fused_attention import TQPagedAttention
+        from turboquant.fused_attention import TQPagedAttention
         fused = TQPagedAttention(tq, num_heads)
         _tq_fused_attn[layer_idx] = fused
     key_cache = kv_cache[:, 0]

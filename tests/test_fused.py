@@ -12,9 +12,9 @@ import math
 import pytest
 import torch
 
-from aither_kvcache.quantizer import TurboQuant
-from aither_kvcache.rotation import random_orthogonal
-from aither_kvcache.fused_attention import TQPagedAttention
+from turboquant import TurboQuant
+from turboquant.rotation import random_orthogonal
+from turboquant.fused_attention import TQPagedAttention
 
 DEVICE = "cpu"
 HEAD_DIM = 128

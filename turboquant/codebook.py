@@ -82,6 +82,66 @@ def get_codebook(d: int, bits: int) -> Tuple[np.ndarray, np.ndarray, float]:
     return centroids, boundaries_inner, mse_total
 
 
+def get_correction_factors(d: int, bits: int) -> np.ndarray:
+    """
+    Compute per-centroid inner-product bias correction factors.
+
+    For Lloyd-Max quantization on N(0, 1/d), the reconstructed inner product
+    <q, x_hat> is a biased estimator of <q, x>. The correction factor for
+    centroid i is: alpha_i = E[x | x in bin_i] / c_i.
+
+    For a perfect Lloyd-Max codebook this is ~1.0, but finite-precision
+    centroids and boundary discretization introduce small biases. Computing
+    these analytically and applying them removes the systematic IP bias.
+
+    Returns:
+        correction: array of shape [2^bits], values close to 1.0.
+    """
+    if bits not in _STANDARD_CODEBOOKS:
+        raise ValueError(f"Supported bit-widths: {list(_STANDARD_CODEBOOKS.keys())}. Got {bits}")
+
+    entry = _STANDARD_CODEBOOKS[bits]
+    std_centroids = entry["centroids"]
+    num_levels = 1 << bits
+    sigma = 1.0 / math.sqrt(d)
+
+    # Standard N(0,1) boundaries
+    boundaries = np.empty(num_levels + 1)
+    boundaries[0] = -10.0  # effectively -inf
+    boundaries[-1] = 10.0  # effectively +inf
+    for i in range(num_levels - 1):
+        boundaries[i + 1] = (std_centroids[i] + std_centroids[i + 1]) / 2
+
+    # Compute E[x | x in bin_i] for N(0,1)
+    # E[x | b_lo <= x < b_hi] = (phi(b_lo) - phi(b_hi)) / (Phi(b_hi) - Phi(b_lo))
+    # where phi = pdf, Phi = cdf of N(0,1)
+    from math import exp as _exp, pi as _pi
+
+    def _phi(x):
+        return (1.0 / math.sqrt(2 * _pi)) * _exp(-0.5 * x * x)
+
+    def _Phi(x):
+        # Abramowitz & Stegun approximation (accurate to 1e-7)
+        t = 1.0 / (1.0 + 0.2316419 * abs(x))
+        poly = t * (0.319381530 + t * (-0.356563782 + t * (
+            1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+        val = 1.0 - _phi(x) * poly
+        return val if x >= 0 else 1.0 - val
+
+    corrections = np.ones(num_levels, dtype=np.float64)
+    for i in range(num_levels):
+        b_lo = boundaries[i]
+        b_hi = boundaries[i + 1]
+        prob = _Phi(b_hi) - _Phi(b_lo)
+        if prob < 1e-15 or abs(std_centroids[i]) < 1e-15:
+            corrections[i] = 1.0
+            continue
+        cond_mean = (_phi(b_lo) - _phi(b_hi)) / prob
+        corrections[i] = cond_mean / std_centroids[i]
+
+    return corrections.astype(np.float32)
+
+
 def get_theory_bounds(bits: int) -> Tuple[float, float]:
     """Return (lower_bound, upper_bound) on MSE for b-bit quantization."""
     lower = 1.0 / (4 ** bits)

@@ -18,14 +18,14 @@ import pytest
 import torch
 import numpy as np
 
-from aither_kvcache.codebook import (
+from turboquant.codebook import (
     get_codebook, get_theory_bounds, _STANDARD_CODEBOOKS,
 )
-from aither_kvcache.rotation import (
+from turboquant.rotation import (
     random_orthogonal, hadamard_matrix, randomized_hadamard_matrix,
     fast_hadamard_transform,
 )
-from aither_kvcache.packing import (
+from turboquant.packing import (
     pack_4bit, unpack_4bit,
     pack_3bit, unpack_3bit,
     pack_2bit, unpack_2bit,

@@ -24,7 +24,7 @@ NUM_BLOCKS = 64
 
 @pytest.fixture
 def uniform_tq():
-    from aither_kvcache.quantizer import TurboQuant
+    from turboquant import TurboQuant
     return TurboQuant(head_dim=HEAD_DIM, bits=4, device="cpu")
 
 
@@ -409,7 +409,7 @@ class TestPackedDimConsistency:
         assert pd25 < pd35
 
     def test_uniform_packed_size(self):
-        from aither_kvcache.packing import packed_size
+        from turboquant.packing import packed_size
         pd4 = packed_size(HEAD_DIM, 4)  # 4-bit: 128*4/8 = 64
         pd3 = packed_size(HEAD_DIM, 3)
         pd2 = packed_size(HEAD_DIM, 2)
@@ -455,7 +455,7 @@ class TestCacheRoundtrip:
             packed_dim = tq.layout.packed_dim
             is_hybrid = True
         else:
-            from aither_kvcache.packing import packed_size
+            from turboquant.packing import packed_size
             packed_dim = packed_size(HEAD_DIM, tq.bits)
             is_hybrid = False
 

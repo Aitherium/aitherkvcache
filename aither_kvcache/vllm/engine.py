@@ -79,10 +79,16 @@ def apply_tq_patches(bits: int = 4) -> bool:
         # PRIMARY mode: TQ IS the KV cache. page_size tells vLLM that blocks
         # are TQ-compressed size so it allocates more blocks for the same VRAM.
         # reshape intercept views those blocks as uint8 TQ layout.
+        # AITHER_TQ_RESHAPE=0 opts out for deployments where a baked backend
+        # (e.g. the fork-native tq-t4nc path) owns the cache layout instead.
         results.append(("page_size", _patch_page_size()))
         results.append(("max_memory", _patch_max_memory()))
-        results.append(("reshape", _patch_reshape()))
-        logger.info("  page_size + max_memory + reshape: ENABLED (primary cache)")
+        if os.environ.get("AITHER_TQ_RESHAPE", "1") == "1":
+            results.append(("reshape", _patch_reshape()))
+            logger.info("  page_size + max_memory + reshape: ENABLED (primary cache)")
+        else:
+            logger.info("  page_size + max_memory: ENABLED (primary cache, "
+                        "reshape DISABLED via AITHER_TQ_RESHAPE=0)")
     else:
         # SHADOW mode: vLLM uses standard FP8 cache. TQ encodes a shadow copy.
         fused = os.environ.get("AITHER_TQ_FUSED", "0") == "1"
@@ -116,7 +122,7 @@ def _tq_page_size_bytes(block_size: int, num_kv_heads: int, head_size: int) -> i
         # Hybrid embeds norms in packed data -- no separate +4
         return 2 * block_size * num_kv_heads * pd
     else:
-        from ..packing import packed_size
+        from turboquant.packing import packed_size
         pd = packed_size(head_size, _TQ_BITS)
         # Uniform: packed indices + 4 bytes for f32 norm
         return 2 * block_size * num_kv_heads * (pd + 4)
@@ -129,12 +135,12 @@ def _tq_dim_for_head(head_size: int) -> int:
         from ..hybrid_quantizer import HybridTurboQuant
         return HybridTurboQuant.packed_dim_for_mode(head_size, tq_mode)
     else:
-        from ..packing import packed_size
+        from turboquant.packing import packed_size
         return packed_size(head_size, _TQ_BITS) + 4
 
 
 def _align_page_size(raw_bytes: int) -> int:
-    """Round page size up to the next power of 2 for cross-layer divisibility.
+    """Optionally round page size up to a power of 2 for cross-layer divisibility.
 
     vLLM's unify_kv_cache_spec_page_size() requires all layer page sizes to be
     divisible by the max page size. With heterogeneous head dims (e.g. Gemma 4:
@@ -142,10 +148,17 @@ def _align_page_size(raw_bytes: int) -> int:
     larger ones. Padding to next power-of-2 ensures any layer's padded page
     size divides any other's (both are powers of 2 -> larger divides by smaller).
 
-    For uniform models, this is a no-op if page size is already a power of 2,
-    and at worst wastes a few bytes per block (acceptable for correctness).
+    OFF by default (AITHER_TQ_ALIGN_PAGES=0): for uniform models the padding
+    is pure waste — e.g. Nemotron-8B TQ4 pages are 17408 B, aligned to 32768 B
+    that nearly HALVES effective compression — and the padding broke the
+    reshape patch's exact-view invariant (D-395 follow-up: boot crash
+    "shape invalid for input of size"). Set AITHER_TQ_ALIGN_PAGES=1 for
+    heterogeneous head-dim models; the reshape patch then uses a strided
+    view that skips per-page padding.
     """
     if raw_bytes <= 0:
+        return raw_bytes
+    if os.environ.get("AITHER_TQ_ALIGN_PAGES", "0") != "1":
         return raw_bytes
     # Next power of 2 >= raw_bytes
     p = 1
@@ -367,21 +380,53 @@ def _patch_reshape() -> bool:
                     ).get(layer_name, raw_tensor)
                     continue
 
-                kv_caches[layer_name] = (
-                    raw_tensor
-                    .view(torch.uint8)
-                    .view(kernel_num_blocks, 2, kernel_block_size,
-                          num_kv_heads, tq_dim)
-                )
+                # Pages may be padded (AITHER_TQ_ALIGN_PAGES=1, heterogeneous
+                # head dims). Only unpadded_bytes per page are TQ payload.
+                unpadded_bytes = 2 * kernel_block_size * num_kv_heads * tq_dim
+                payload_per_page = unpadded_bytes * num_blocks_per_kv_block
+                raw_uint8 = raw_tensor.view(torch.uint8)
+
+                if page_bytes == payload_per_page:
+                    # Exact pages — direct zero-copy view (default path)
+                    kv_caches[layer_name] = raw_uint8.view(
+                        kernel_num_blocks, 2, kernel_block_size,
+                        num_kv_heads, tq_dim)
+                elif num_blocks_per_kv_block == 1:
+                    # Padded pages: strided view that SKIPS the per-page
+                    # padding while still ALIASING the raw tensor. Never
+                    # .contiguous() here — that copies, silently doubling
+                    # KV VRAM and desyncing from vLLM's raw-tensor paths
+                    # (sleep/wake offload).
+                    kv_caches[layer_name] = raw_uint8.as_strided(
+                        (kernel_num_blocks, 2, kernel_block_size,
+                         num_kv_heads, tq_dim),
+                        (page_bytes,
+                         kernel_block_size * num_kv_heads * tq_dim,
+                         num_kv_heads * tq_dim,
+                         tq_dim,
+                         1))
+                else:
+                    # Padded pages + kernel block splitting: the intra-page
+                    # kernel-block stride differs from the inter-page stride,
+                    # which a single as_strided cannot express. Refuse loudly
+                    # rather than serve a misaligned cache.
+                    raise RuntimeError(
+                        f"[TQ] {layer_name}: padded pages "
+                        f"({page_bytes}B vs payload {payload_per_page}B) "
+                        f"combined with kernel block splitting "
+                        f"({num_blocks_per_kv_block}x) is unsupported — "
+                        f"unset AITHER_TQ_ALIGN_PAGES or use a block size "
+                        f"equal to the kernel block size.")
                 tq_layer_count += 1
                 last_tq_dim = tq_dim
 
         if tq_layer_count > 0:
-            logger.info(
-                "[TQ] Primary reshape: %d layers -> uint8 "
-                "[blocks, 2, bs, heads, tq_dim=%d] (TQ%d)",
-                tq_layer_count, last_tq_dim, _TQ_BITS,
-            )
+            import sys
+            msg = (f"[TQ] Primary reshape: {tq_layer_count} layers -> uint8 "
+                   f"[blocks, 2, bs, heads, tq_dim={last_tq_dim}] "
+                   f"(TQ{_TQ_BITS})")
+            logger.info(msg)
+            print(msg, file=sys.stderr, flush=True)
 
         return kv_caches
 
@@ -425,6 +470,31 @@ def _extract_block_indices_from_free(request) -> list:
     return []
 
 
+def _blocks_for_free(manager, request) -> list:
+    """Resolve the GPU block ids a free() call is about to release.
+
+    On vLLM v1 (0.19+) the Request object carries only request_id — block
+    lists live in manager.coordinator.single_type_managers[*].req_to_blocks.
+    Must be read BEFORE original_free() (which clears the mapping). Falls
+    back to the legacy attribute paths for older engines.
+    """
+    rid = getattr(request, "request_id", None)
+    if rid is None and isinstance(request, str):
+        rid = request
+    coord = getattr(manager, "coordinator", None)
+    if rid is not None and coord is not None:
+        out = []
+        for stm in getattr(coord, "single_type_managers", ()) or ():
+            blocks = getattr(stm, "req_to_blocks", {}).get(rid) or []
+            for b in blocks:
+                bid = getattr(b, "block_id", None)
+                if bid is not None and bid > 0:  # 0 = null block
+                    out.append(bid)
+        if out:
+            return out
+    return _extract_block_indices_from_free(request)
+
+
 def _patch_block_manager() -> bool:
     """
     Monkey-patch vLLM's KVCacheManager.free() to spill TQ-compressed
@@ -450,10 +520,43 @@ def _patch_block_manager() -> bool:
         """Spill TQ blocks to DDR5 before vLLM frees them."""
         try:
             from .backend import TurboQuantImpl
+
+            # PRIMARY mode: spill evicted blocks from the uint8 primary cache
+            # into the DDR5 cold tier (TQPrimaryColdTier). SHADOW mode spills
+            # from TQGPUCache below — the two tiers are mutually exclusive.
+            cold = getattr(TurboQuantImpl, "_primary_cold_tier", None)
+            if cold is not None:
+                try:
+                    primary_indices = _blocks_for_free(self, request)
+                    if primary_indices:
+                        n = cold.spill(
+                            TurboQuantImpl._primary_kv_caches,
+                            TurboQuantImpl._primary_k_norms,
+                            TurboQuantImpl._primary_v_norms,
+                            primary_indices,
+                        )
+                        logger.debug(
+                            "TQ primary spill-on-free: %d blocks -> DDR5", n)
+                        if n and not getattr(cold, "_first_spill_logged", False):
+                            cold._first_spill_logged = True
+                            import sys
+                            print(f"[TQ] primary cold tier FIRST SPILL: {n} "
+                                  f"blocks -> DDR5", file=sys.stderr, flush=True)
+                except Exception as exc:
+                    logger.debug("TQ primary spill error: %s", exc)
+                    cold._spill_err_n = getattr(cold, "_spill_err_n", 0) + 1
+                    if cold._spill_err_n == 1 or cold._spill_err_n % 200 == 0:
+                        import sys
+                        import traceback
+                        print(f"[TQ] primary cold tier spill ERROR "
+                              f"(first occurrence): {exc!r}",
+                              file=sys.stderr, flush=True)
+                        traceback.print_exc(file=sys.stderr)
+
             tq_cache = TurboQuantImpl._tq_gpu_cache
             if tq_cache is not None:
                 import torch
-                block_indices = _extract_block_indices_from_free(request)
+                block_indices = _blocks_for_free(self, request)
                 if block_indices:
                     bi = torch.tensor(block_indices, dtype=torch.long)
                     tq_cache.spill_blocks(bi)

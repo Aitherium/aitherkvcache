@@ -140,7 +140,7 @@ def run_context_impact():
 
 
 if __name__ == "__main__":
-    print("TurboQuant v0.1.0 — KV Cache Quantization Benchmark")
+    print("TurboQuant v2.1.0 — KV Cache Quantization Benchmark")
     print("Paper: arXiv:2504.19874 (Zandieh et al., 2025)")
 
     run_validation()

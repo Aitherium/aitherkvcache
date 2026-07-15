@@ -40,7 +40,7 @@ Usage:
     candidates = advisor.get_eviction_candidates(n=16)
 """
 
-from .quantizer import TurboQuant, TurboQuantConfig
+from turboquant import TurboQuant, TurboQuantConfig
 from .hybrid_quantizer import HybridTurboQuant, HybridLayout, GroupLayout
 from .kvcache_graph import KVCacheGraph, KVBlockNode, KVEdge, EdgeType, get_kvcache_graph
 from .eviction_advisor import GraphEvictionAdvisor, reorder_by_ranking
@@ -56,4 +56,4 @@ __all__ = [
     # TriAttention — lazy-loaded via subpackage
     # from aither_kvcache.triattention import TriAttention, TriAttentionConfig
 ]
-__version__ = "2.0.1"
+__version__ = "2.1.0"

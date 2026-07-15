@@ -66,9 +66,11 @@ class TQPagedAttentionRef:
         head_dim: int,
         block_size: int,
         bits: int = 4,
+        k_centroids: Optional[torch.Tensor] = None,
     ):
         self.rotation = rotation          # [head_dim, head_dim]
-        self.centroids = centroids        # [num_levels]
+        self.centroids = centroids        # [num_levels] — used for V accumulation
+        self.k_centroids = k_centroids if k_centroids is not None else centroids  # for K scoring
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.num_query_heads = num_query_heads
@@ -81,12 +83,14 @@ class TQPagedAttentionRef:
         from .packing import unpack_4bit, unpack_3bit, unpack_2bit
         self._unpack_fns = {4: unpack_4bit, 3: unpack_3bit, 2: unpack_2bit}
 
-    def _unpack_to_full(self, packed_vec: torch.Tensor) -> torch.Tensor:
+    def _unpack_to_full(self, packed_vec: torch.Tensor,
+                        codebook: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Unpack a single packed vector to full head_dim via codebook lookup."""
         # packed_vec: [packed_dim] uint8
+        cb = codebook if codebook is not None else self.centroids
         unpack_fn = self._unpack_fns.get(self.bits, self._unpack_fns[4])
         indices = unpack_fn(packed_vec.unsqueeze(0), self.head_dim).squeeze(0)
-        return self.centroids[indices.long()]
+        return cb[indices.long()]
 
     def forward(
         self,
@@ -136,9 +140,9 @@ class TQPagedAttentionRef:
                     n_valid = end - start
 
                     for pos in range(n_valid):
-                        # Unpack K → full rotated vector via codebook
+                        # Unpack K → full rotated vector via corrected codebook
                         packed_k = k_packed[phys_block, pos, kv_head]
-                        k_full = self._unpack_to_full(packed_k)
+                        k_full = self._unpack_to_full(packed_k, self.k_centroids)
                         k_even = k_full[0::2]
                         k_odd = k_full[1::2]
 
@@ -214,8 +218,9 @@ if HAS_TRITON:
         # Paged block indirection
         block_tables_ptr,     # [num_seqs, max_blocks_per_seq] int32/int64
         context_lens_ptr,     # [num_seqs] int32/int64
-        # Codebook
-        centroids_ptr,        # [16] float32
+        # Codebooks (separate for K scoring and V accumulation)
+        k_centroids_ptr,      # [16] float32 — corrected centroids for K scoring
+        v_centroids_ptr,      # [16] float32 — raw centroids for V accumulation
         # Output accumulators (rotated domain, even/odd split)
         out_even_ptr,         # [num_seqs, num_q_heads, HALF_D] float32
         out_odd_ptr,          # [num_seqs, num_q_heads, HALF_D] float32
@@ -300,8 +305,8 @@ if HAS_TRITON:
                             k_packed_ptr + kp_base + half_offs
                         ).to(tl.int32)
 
-                        k_even = tl.load(centroids_ptr + ((kp >> 4) & 0xF))
-                        k_odd = tl.load(centroids_ptr + (kp & 0xF))
+                        k_even = tl.load(k_centroids_ptr + ((kp >> 4) & 0xF))
+                        k_odd = tl.load(k_centroids_ptr + (kp & 0xF))
 
                         # ── Score ──
                         k_norm = tl.load(
@@ -332,8 +337,8 @@ if HAS_TRITON:
                             v_packed_ptr + vp_base + half_offs
                         ).to(tl.int32)
 
-                        v_even = tl.load(centroids_ptr + ((vp >> 4) & 0xF))
-                        v_odd = tl.load(centroids_ptr + (vp & 0xF))
+                        v_even = tl.load(v_centroids_ptr + ((vp >> 4) & 0xF))
+                        v_odd = tl.load(v_centroids_ptr + (vp & 0xF))
                         v_norm = tl.load(
                             v_norms_ptr
                             + phys_block * stride_kn_block
@@ -371,7 +376,7 @@ if HAS_TRITON:
         k_packed_ptr, k_norms_ptr,
         v_packed_ptr, v_norms_ptr,
         block_tables_ptr, context_lens_ptr,
-        centroids_ptr,
+        k_centroids_ptr, v_centroids_ptr,
         # Partial outputs: [num_q_heads, num_seqs, NUM_SPLITS, HALF_D]
         part_even_ptr, part_odd_ptr,
         # Partial softmax state: [num_q_heads, num_seqs, NUM_SPLITS]
@@ -431,8 +436,8 @@ if HAS_TRITON:
                             k_packed_ptr + kp_base + half_offs
                         ).to(tl.int32)
 
-                        k_even = tl.load(centroids_ptr + ((kp >> 4) & 0xF))
-                        k_odd = tl.load(centroids_ptr + (kp & 0xF))
+                        k_even = tl.load(k_centroids_ptr + ((kp >> 4) & 0xF))
+                        k_odd = tl.load(k_centroids_ptr + (kp & 0xF))
 
                         k_norm = tl.load(
                             k_norms_ptr + phys_block * stride_kn_block
@@ -457,8 +462,8 @@ if HAS_TRITON:
                             v_packed_ptr + vp_base + half_offs
                         ).to(tl.int32)
 
-                        v_even = tl.load(centroids_ptr + ((vp >> 4) & 0xF))
-                        v_odd = tl.load(centroids_ptr + (vp & 0xF))
+                        v_even = tl.load(v_centroids_ptr + ((vp >> 4) & 0xF))
+                        v_odd = tl.load(v_centroids_ptr + (vp & 0xF))
                         v_norm = tl.load(
                             v_norms_ptr + phys_block * stride_kn_block
                             + pos * stride_kn_pos + kv_head)
@@ -560,6 +565,9 @@ class TQPagedAttention:
         self.rotation = tq.rotation
         self.rotation_T = tq.rotation.T.contiguous()  # pre-transposed, contiguous
         self.centroids = tq.centroids
+        # Corrected centroids for unbiased inner product scoring (K path only).
+        # V accumulation uses raw centroids (correction only affects score bias).
+        self.k_centroids = tq.centroids * tq.correction_factors
         self.scale = 1.0 / math.sqrt(tq.head_dim)
         self.head_dim = tq.head_dim
         self.num_levels = tq.num_levels
@@ -577,6 +585,7 @@ class TQPagedAttention:
             head_dim=tq.head_dim,
             block_size=16,
             bits=tq.bits,
+            k_centroids=self.k_centroids,
         )
 
         # Block selector for sparse attention (optional)
@@ -697,7 +706,7 @@ class TQPagedAttention:
                 q_even, q_odd,
                 k_packed, k_norms, v_packed, v_norms,
                 block_tables, context_lens,
-                self.centroids,
+                self.k_centroids, self.centroids,
                 part_even, part_odd, part_m, part_l,
                 q_even.stride(0), q_even.stride(1),
                 k_packed.stride(0), k_packed.stride(1), k_packed.stride(2),
@@ -724,7 +733,7 @@ class TQPagedAttention:
                 q_even, q_odd,
                 k_packed, k_norms, v_packed, v_norms,
                 block_tables, context_lens,
-                self.centroids,
+                self.k_centroids, self.centroids,
                 out_even, out_odd,
                 q_even.stride(0), q_even.stride(1),
                 k_packed.stride(0), k_packed.stride(1), k_packed.stride(2),

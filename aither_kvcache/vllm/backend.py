@@ -13,7 +13,7 @@ Usage:
     )
     register_backend(
         AttentionBackendEnum.CUSTOM,
-        "lib.gpu.turboquant.vllm_custom_backend.TurboQuantBackend",
+        "aither_kvcache.vllm.backend.TurboQuantBackend",
     )
 
 Architecture:
@@ -36,14 +36,182 @@ imports during sitecustomize (vllm.config partially initialized).
 vLLM resolves "TurboQuantBackend" via getattr(module, name) which
 triggers lazy creation only after all vLLM modules are loaded.
 """
+# SYNCED from AitherOS monorepo canonical lib/gpu/turboquant/vllm_custom_backend.py
+# (import paths rewritten for the wheel layout by the sync transform). EDIT THE
+# MONOREPO CANONICAL, not this file — see .github/workflows/sync-kvcache.yml.
 
 import os
 import logging
+import time
 from typing import ClassVar, Optional, Set
 
 import torch
 
 logger = logging.getLogger("aither.turboquant.backend")
+
+
+def compute_cold_max_blocks(
+    num_layers: int, block_size: int, num_kv_heads: int,
+    packed_dim: int, is_hybrid: bool,
+    ddr5_budget_gb: float = None,
+) -> Optional[int]:
+    """Compute cold tier block count from DDR5 budget.
+
+    Returns None if no DDR5 budget is configured (falls back to GPU max_blocks).
+    """
+    if ddr5_budget_gb is None:
+        ddr5_budget_gb = float(os.environ.get("AITHER_TQ_DDR5_BUDGET_GB", "0"))
+    if ddr5_budget_gb <= 0:
+        return None
+    per_vec = packed_dim if is_hybrid else (packed_dim + 4)
+    per_block = num_layers * 2 * block_size * num_kv_heads * per_vec
+    return int(ddr5_budget_gb * (1024 ** 3) / per_block)
+
+
+def _instance_tenant() -> str:
+    """Tenant this vLLM instance serves, from AITHER_TQ_INSTANCE_TENANT.
+
+    KV blocks are registered inside a batched forward pass where no per-sequence
+    tenant is available at this layer, so KV tenant isolation is enforced at
+    INSTANCE granularity: each per-tenant vLLM deployment (AitherOS's scoped
+    per-tenant model architecture) sets AITHER_TQ_INSTANCE_TENANT to its tenant;
+    the shared platform orchestrator leaves it unset ('platform'). Because it is
+    a process-level identity it is also available in the background shadow/recover
+    routine — unlike the request-scoped tenant ContextVar. A single shared
+    instance batching MULTIPLE tenants would instead need per-sequence tenant
+    threading in the engine (a separate, larger change); that is not the model
+    AitherOS deploys.
+    """
+    return os.environ.get("AITHER_TQ_INSTANCE_TENANT", "platform") or "platform"
+
+
+def _resolve_request_tenant(request_id: Optional[str] = None) -> str:
+    """Resolve a block's tenant, with precedence: per-request > instance > platform.
+
+    When AITHER_REQUEST_TENANT_ISOLATION=1, checks the request_id in the
+    registry for the per-request tenant. If not found or if isolation is
+    disabled, falls back to the instance tenant.
+
+    Args:
+        request_id: Optional request identifier from vLLM RequestOutput.
+                   If None or isolation disabled, uses instance tenant.
+
+    Returns:
+        Resolved tenant_slug string.
+
+    This ensures that when multiple requests (tenants A, B) are batched in
+    the same vLLM process, their KV blocks are tagged with the correct
+    per-request tenant, not just the instance tenant.
+    """
+    try:
+        from aither_kvcache.request_tenant_registry import resolve_request_tenant
+        return resolve_request_tenant(request_id, instance_tenant=_instance_tenant())
+    except ImportError:
+        # Registry module not available; fall back to instance tenant
+        return _instance_tenant()
+
+
+def _update_attended_blocks(block_table, context_lens, table):
+    """Update last_attended timestamps for blocks in attention.
+
+    Called from the fused attention forward hook to track which blocks
+    were accessed during decode steps. This enables recency-based
+    eviction policies and cold-tier warming strategies.
+
+    Args:
+        block_table: torch.Tensor of shape (batch_size, max_blocks_per_seq),
+                    containing physical block indices per sequence. Padding
+                    marked with -1.
+        context_lens: torch.Tensor of shape (batch_size,), containing the
+                     token count per sequence.
+        table: BlockMetadataTable instance, or None.
+
+    No-ops gracefully if table is None or context_lens is all-zero.
+    Deduplicates blocks across sequences before updating.
+    """
+    if table is None:
+        return
+
+    if block_table is None or context_lens is None:
+        return
+
+    # Safely handle both CPU and GPU tensors
+    try:
+        block_table = block_table.cpu() if hasattr(block_table, "cpu") else (
+            block_table
+        )
+        context_lens = context_lens.cpu() if hasattr(context_lens, "cpu") else (
+            context_lens
+        )
+    except (RuntimeError, AttributeError):
+        # CUDA/device error or a tensor-like without .cpu(): fall back to
+        # operating on the objects as-is rather than failing attention tracking.
+        pass
+
+    # Collect all unique attended block indices across sequences
+    attended_blocks = set()
+
+    # Handle both 1D and 2D block_table
+    if block_table.dim() == 1:
+        # 1D case: single sequence's block indices
+        # Get context length (should be scalar or single-element 1D for 1D
+        # block_table). A 2D+ context_lens here is a caller contract
+        # violation (docstring: shape (batch_size,)) — reject explicitly
+        # rather than let int() on a multi-element slice raise a confusing
+        # "only one element tensors can be converted to Python scalars".
+        if context_lens.dim() > 1:
+            raise ValueError(
+                f"context_lens must be 0D or 1D for a 1D block_table, "
+                f"got shape {tuple(context_lens.shape)}"
+            )
+        if context_lens.dim() == 1 and context_lens.shape[0] not in (0, 1):
+            raise ValueError(
+                f"context_lens length ({context_lens.shape[0]}) must be 0 or 1 "
+                f"for a 1D (single-sequence) block_table"
+            )
+        if context_lens.dim() == 1:
+            context_len = int(context_lens[0]) if context_lens.shape[0] > 0 else 0
+        else:
+            context_len = int(context_lens)
+
+        # Process blocks if context is non-empty
+        if context_len > 0:
+            for block_idx_val in block_table:
+                block_idx = int(block_idx_val)
+                if block_idx >= 0:  # Skip padding (-1)
+                    attended_blocks.add(block_idx)
+    else:
+        # 2D case: multiple sequences
+        batch_size = block_table.shape[0]
+        # Validate context_lens length matches batch_size
+        if context_lens.dim() >= 1 and context_lens.shape[0] != batch_size:
+            raise ValueError(
+                f"context_lens length ({context_lens.shape[0]}) must match "
+                f"block_table batch size ({batch_size})"
+            )
+        for seq_idx in range(batch_size):
+            # Get context length for this sequence
+            if context_lens.dim() >= 1:
+                context_len = int(context_lens[seq_idx])
+            else:
+                context_len = int(context_lens)
+
+            # Skip empty sequences
+            if context_len <= 0:
+                continue
+
+            # Get block indices for this sequence
+            block_indices = block_table[seq_idx]
+
+            # Extract and deduplicate valid (non-negative) block indices
+            for block_idx_val in block_indices:
+                block_idx = int(block_idx_val)
+                if block_idx >= 0:  # Skip padding (-1)
+                    attended_blocks.add(block_idx)
+
+    # Update all attended blocks with current timestamp
+    if attended_blocks:
+        table.update_attention(list(attended_blocks), time.time())
 
 
 # ================================================================
@@ -63,7 +231,8 @@ class TQGPUCache:
 
     def __init__(self, num_layers: int, max_blocks: int, block_size: int,
                  num_kv_heads: int, head_dim: int, bits: int = 4,
-                 device: str = "cuda", mode: str = ""):
+                 device: str = "cuda", mode: str = "",
+                 cold_max_blocks: Optional[int] = None):
         self.num_layers = num_layers
         self.max_blocks = max_blocks
         self.block_size = block_size
@@ -75,15 +244,15 @@ class TQGPUCache:
         self.is_hybrid = self.mode in ("tq35", "tq25")
 
         if self.is_hybrid:
-            from .hybrid_quantizer import HybridTurboQuant
+            from aither_kvcache.hybrid_quantizer import HybridTurboQuant
             self.htq = HybridTurboQuant(
                 head_dim=head_dim, mode=self.mode, device=device)
             self.htq.calibrate_uniform()
             self.tq = None  # not used in hybrid mode
             self.packed_dim = self.htq.packed_dim
         else:
-            from .quantizer import TurboQuant
-            from .packing import packed_size
+            from turboquant import TurboQuant
+            from turboquant.packing import packed_size
             self.tq = TurboQuant(head_dim=head_dim, bits=bits, device=device)
             self.htq = None
             self.packed_dim = packed_size(head_dim, bits)
@@ -117,43 +286,58 @@ class TQGPUCache:
             self.k_norms = None
             self.v_norms = None
 
+        # Cold tier sizing — independent from GPU tier
+        if cold_max_blocks is None:
+            cold_max_blocks = compute_cold_max_blocks(
+                num_layers, block_size, num_kv_heads,
+                self.packed_dim, self.is_hybrid,
+            )
+        _cold_blocks = cold_max_blocks if cold_max_blocks is not None else max_blocks
+        self.cold_max_blocks = _cold_blocks
+
         # Detect WSL2 (even from inside Docker) -- pinned memory segfaults.
         try:
             _can_pin = torch.cuda.is_available() and torch.zeros(1).pin_memory().is_pinned()
         except Exception:
             _can_pin = False
 
-        # Cold tier (DDR5)
+        # Cold tier (DDR5) — sized independently from GPU
         self._cold_k_packed = torch.zeros(
-            num_layers, max_blocks, block_size, num_kv_heads, self.packed_dim,
+            num_layers, _cold_blocks, block_size, num_kv_heads, self.packed_dim,
             dtype=torch.uint8, pin_memory=_can_pin)
         self._cold_v_packed = torch.zeros(
-            num_layers, max_blocks, block_size, num_kv_heads, self.packed_dim,
+            num_layers, _cold_blocks, block_size, num_kv_heads, self.packed_dim,
             dtype=torch.uint8, pin_memory=_can_pin)
         if not self.is_hybrid:
             self._cold_k_norms = torch.zeros(
-                num_layers, max_blocks, block_size, num_kv_heads,
+                num_layers, _cold_blocks, block_size, num_kv_heads,
                 dtype=torch.float32, pin_memory=_can_pin)
             self._cold_v_norms = torch.zeros(
-                num_layers, max_blocks, block_size, num_kv_heads,
+                num_layers, _cold_blocks, block_size, num_kv_heads,
                 dtype=torch.float32, pin_memory=_can_pin)
         else:
             self._cold_k_norms = None
             self._cold_v_norms = None
-        self._cold_valid = torch.zeros(max_blocks, dtype=torch.bool)
+        self._cold_valid = torch.zeros(_cold_blocks, dtype=torch.bool)
         self._spilled_set: Set[int] = set()
 
         if self.is_hybrid:
             per_vec = self.packed_dim  # norms embedded
         else:
             per_vec = self.packed_dim + 4  # +4 for f32 norm
-        compressed_mb = (
+        gpu_mb = (
             num_layers * 2 * max_blocks * block_size * num_kv_heads
             * per_vec / (1024 ** 2)
         )
+        cold_mb = (
+            num_layers * 2 * _cold_blocks * block_size * num_kv_heads
+            * per_vec / (1024 ** 2)
+        )
         logger.info(
-            "TQGPUCache: %d layers x %d blocks @ %s, %.0f MB VRAM + %.0f MB DDR5",
-            num_layers, max_blocks, self.mode.upper(), compressed_mb, compressed_mb,
+            "TQGPUCache: %d layers x %d GPU blocks + %d cold blocks @ %s, "
+            "%.0f MB VRAM + %.0f MB DDR5",
+            num_layers, max_blocks, _cold_blocks, self.mode.upper(),
+            gpu_mb, cold_mb,
         )
 
     def encode_and_store(self, layer_idx: int, key: torch.Tensor,
@@ -222,15 +406,17 @@ class TQGPUCache:
 
     def cold_tier_stats(self) -> dict:
         valid_blocks = self._cold_valid.sum().item()
+        per_vec = self.packed_dim if self.is_hybrid else (self.packed_dim + 4)
         per_block_bytes = (
             2 * self.block_size * self.num_kv_heads
-            * (self.packed_dim + 4) * self.num_layers
+            * per_vec * self.num_layers
         )
         return {
             "cold_blocks": valid_blocks,
             "cold_tokens": valid_blocks * self.block_size,
             "cold_mb": valid_blocks * per_block_bytes / (1024 ** 2),
-            "max_blocks": self.max_blocks,
+            "cold_max_blocks": self.cold_max_blocks,
+            "cold_max_tokens": self.cold_max_blocks * self.block_size,
         }
 
     def has_spilled(self, block_idx: int) -> bool:
@@ -238,6 +424,161 @@ class TQGPUCache:
 
     def clear_spilled(self, block_indices: list) -> None:
         self._spilled_set.difference_update(block_indices)
+
+
+# ================================================================
+# PRIMARY-MODE DDR5 COLD TIER
+# ================================================================
+
+class TQPrimaryColdTier:
+    """DDR5 (pinned host RAM) spill tier for PRIMARY mode.
+
+    In PRIMARY mode the vLLM KV cache tensors ARE the TQ-compressed cache
+    (uint8, per-layer), so unlike SHADOW mode there is no TQGPUCache holding
+    a copy. This tier receives evicted blocks: on KVCacheManager.free() the
+    engine hook copies the block's packed K/V (all layers) plus its f32 norms
+    into pinned host buffers, preserving the KV data for later warming.
+
+    Slot management is a simple LRU ring: when full, the oldest spilled
+    block's slot is reused. warm() copies a block back into the primary
+    cache tensors (caller is responsible for block-table consistency).
+    """
+
+    def __init__(self, num_layers: int, block_size: int, num_kv_heads: int,
+                 tq_dim: int, cold_blocks: int, can_pin: bool):
+        self.num_layers = num_layers
+        self.block_size = block_size
+        self.num_kv_heads = num_kv_heads
+        self.tq_dim = tq_dim
+        self.cold_max_blocks = cold_blocks
+
+        self._k = torch.zeros(
+            num_layers, cold_blocks, block_size, num_kv_heads, tq_dim,
+            dtype=torch.uint8, pin_memory=can_pin)
+        self._v = torch.zeros_like(self._k)
+        self._kn = torch.zeros(
+            num_layers, cold_blocks, block_size, num_kv_heads,
+            dtype=torch.float32, pin_memory=can_pin)
+        self._vn = torch.zeros_like(self._kn)
+
+        self._slot_of_block: dict = {}          # gpu block idx -> cold slot
+        self._block_of_slot = [-1] * cold_blocks
+        self._next_slot = 0                     # LRU ring cursor
+        self.spilled_count = 0
+
+    def _take_slot(self, block_idx: int) -> int:
+        slot = self._slot_of_block.get(block_idx)
+        if slot is not None:
+            return slot  # re-spill of same block overwrites in place
+        slot = self._next_slot
+        self._next_slot = (self._next_slot + 1) % self.cold_max_blocks
+        old = self._block_of_slot[slot]
+        if old >= 0:
+            self._slot_of_block.pop(old, None)
+        self._block_of_slot[slot] = block_idx
+        self._slot_of_block[block_idx] = slot
+        return slot
+
+    def spill(self, kv_caches: dict, k_norms, v_norms, block_indices) -> int:
+        """Copy blocks from the primary cache (+norm tensors) to DDR5.
+
+        Args:
+            kv_caches: {layer_idx: uint8 kv_cache tensor} registry
+            k_norms/v_norms: [layers, blocks, bs, heads] f32 (may be None
+                if no forward has run yet)
+            block_indices: iterable of GPU block indices to spill
+        Returns: number of blocks spilled.
+        """
+        if not kv_caches:
+            return 0
+        # Snapshot: the registries are class-level dicts mutated by the
+        # WORKER thread (layer registration) while this runs on the
+        # SCHEDULER thread — iterating the live dict can raise
+        # "dictionary changed size during iteration" (review finding).
+        # dict() copy is a single C-level op (GIL-atomic).
+        kv_caches = dict(kv_caches)
+        k_norms = dict(k_norms) if k_norms else None
+        v_norms = dict(v_norms) if v_norms else None
+        done = 0
+        # free() fires on the scheduler thread, OUTSIDE the worker's
+        # torch.inference_mode() context — but these tensors were created
+        # inside it (inference tensors). Mutating an inference tensor
+        # outside inference mode raises RuntimeError, so re-enter it here.
+        with torch.inference_mode():
+            done = self._spill_locked(kv_caches, k_norms, v_norms,
+                                      block_indices)
+        self.spilled_count += done
+        return done
+
+    def _spill_locked(self, kv_caches, k_norms, v_norms, block_indices) -> int:
+        done = 0
+        for b in block_indices:
+            b = int(b)
+            if b < 0:
+                continue
+            slot = self._take_slot(b)
+            for li, kv in kv_caches.items():
+                if b >= kv.shape[0]:
+                    continue
+                # Guard: [bs, H, tq_dim] of this layer's K/V block vs the
+                # tier slot. NOTE self._k is [layers, slots, bs, H, tq_dim]
+                # so the per-slot shape is shape[2:] — comparing against
+                # shape[3:] here silently skipped EVERY layer (tuple lengths
+                # differ) and made the whole spill tier a no-op (review
+                # finding, 2026-07-15).
+                if tuple(kv.shape[2:]) != tuple(self._k.shape[2:]):
+                    continue
+                self._k[li, slot].copy_(kv[b, 0], non_blocking=True)
+                self._v[li, slot].copy_(kv[b, 1], non_blocking=True)
+                kn = k_norms.get(li) if k_norms else None
+                vn = v_norms.get(li) if v_norms else None
+                if kn is not None and vn is not None and b < kn.shape[0]:
+                    self._kn[li, slot].copy_(kn[b], non_blocking=True)
+                    self._vn[li, slot].copy_(vn[b], non_blocking=True)
+            done += 1
+        return done
+
+    def warm(self, kv_caches: dict, k_norms, v_norms, block_indices) -> int:
+        """Copy spilled blocks back into the primary cache. Returns count."""
+        kv_caches = dict(kv_caches) if kv_caches else {}
+        k_norms = dict(k_norms) if k_norms else None
+        v_norms = dict(v_norms) if v_norms else None
+        with torch.inference_mode():
+            return self._warm_locked(kv_caches, k_norms, v_norms,
+                                     block_indices)
+
+    def _warm_locked(self, kv_caches, k_norms, v_norms, block_indices) -> int:
+        done = 0
+        for b in block_indices:
+            slot = self._slot_of_block.get(int(b))
+            if slot is None:
+                continue
+            for li, kv in kv_caches.items():
+                if tuple(kv.shape[2:]) != tuple(self._k.shape[2:]):
+                    continue
+                kv[b, 0].copy_(self._k[li, slot], non_blocking=True)
+                kv[b, 1].copy_(self._v[li, slot], non_blocking=True)
+                kn = k_norms.get(li) if k_norms else None
+                vn = v_norms.get(li) if v_norms else None
+                if kn is not None and vn is not None:
+                    kn[b].copy_(self._kn[li, slot], non_blocking=True)
+                    vn[b].copy_(self._vn[li, slot], non_blocking=True)
+            done += 1
+        return done
+
+    def has_spilled(self, block_idx: int) -> bool:
+        return int(block_idx) in self._slot_of_block
+
+    def stats(self) -> dict:
+        per_block = (2 * self.num_layers * self.block_size
+                     * self.num_kv_heads * (self.tq_dim + 8))
+        return {
+            "cold_blocks": len(self._slot_of_block),
+            "cold_max_blocks": self.cold_max_blocks,
+            "cold_tokens": len(self._slot_of_block) * self.block_size,
+            "cold_mb": len(self._slot_of_block) * per_block / (1024 ** 2),
+            "spilled_total": self.spilled_count,
+        }
 
 
 # ================================================================
@@ -255,11 +596,58 @@ def __getattr__(name):
         cls = _make_backend_class()
         globals()["TurboQuantBackend"] = cls
         return cls
+    if name == "TurboQuantImpl":
+        # The engine's spill-on-free hook imports TurboQuantImpl to reach the
+        # class-level cache registries. Resolve it through the same lazy
+        # factory — a bare AttributeError here silently killed the DDR5
+        # spill tier (the ImportError was swallowed at debug level).
+        cls = _get_impl_class()
+        globals()["TurboQuantImpl"] = cls
+        return cls
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _make_backend_class():
     from vllm.v1.attention.backend import AttentionBackend
+
+    # Mirror the parent Triton backend's KV-update contract. On vLLM builds
+    # where TritonAttentionBackend declares forward_includes_kv_cache_update
+    # = False (e.g. the Aitherium 0.19.1 fork), the KV write happens in
+    # do_kv_cache_update() via the unified_kv_cache_update splitting op and
+    # TritonAttentionImpl.forward() NEVER writes KV. Declaring True there
+    # would silently skip every KV write (D-395). On builds where the parent
+    # says True, forward() includes the write and our impl writes inline.
+    try:
+        from vllm.v1.attention.backends.triton_attn import (
+            TritonAttentionBackend,
+        )
+        _parent_fwd_includes_update = getattr(
+            TritonAttentionBackend, "forward_includes_kv_cache_update", True)
+    except ImportError:
+        _parent_fwd_includes_update = True
+
+    def _parent_cap(name, *args, default=False):
+        """Mirror a capability declared by the parent Triton backend.
+
+        The TQ paths delegate real attention math to the Triton stack
+        (parent forward in SHADOW; unified_attention in PRIMARY prefill and
+        slow decode), so capabilities the parent honors are honored here —
+        the fused TQ decode kernel routes around itself for layers that
+        need window/softcap/sink semantics (see _tq_exact_attn_only).
+        FAILURE B (D-395): without these mirrors the nightly validator
+        rejects CUSTOM for gemma4 ("sliding window not supported" +
+        "partial multimodal token full attention not supported").
+        """
+        try:
+            from vllm.v1.attention.backends.triton_attn import (
+                TritonAttentionBackend,
+            )
+            fn = getattr(TritonAttentionBackend, name, None)
+            if fn is None:
+                return default
+            return fn(*args)
+        except ImportError:
+            return default
 
     class TurboQuantBackend(AttentionBackend):
         supported_kv_cache_dtypes = [
@@ -267,10 +655,28 @@ def _make_backend_class():
         ]
         # Tell vLLM Attention layer to pre-allocate output buffer for us
         accept_output_buffer = True
-        # KV cache update is handled by do_kv_cache_update() on the impl,
-        # called via vLLM's unified_kv_cache_update splitting op.
-        # This preserves the standard graph break structure for CUDA graphs.
-        forward_includes_kv_cache_update = False
+        forward_includes_kv_cache_update = _parent_fwd_includes_update
+
+        @classmethod
+        def supports_sliding_window(cls) -> bool:
+            return _parent_cap("supports_sliding_window")
+
+        @classmethod
+        def supports_mm_prefix(cls) -> bool:
+            return _parent_cap("supports_mm_prefix")
+
+        @classmethod
+        def supports_sink(cls) -> bool:
+            return _parent_cap("supports_sink")
+
+        @classmethod
+        def supports_non_causal(cls) -> bool:
+            return _parent_cap("supports_non_causal")
+
+        @classmethod
+        def supports_attn_type(cls, attn_type: str) -> bool:
+            return _parent_cap("supports_attn_type", attn_type,
+                               default=(attn_type == "decoder"))
 
         @staticmethod
         def get_name() -> str:
@@ -285,19 +691,22 @@ def _make_backend_class():
             from vllm.v1.attention.backends.triton_attn import (
                 TritonAttentionMetadataBuilder,
             )
-            from vllm.v1.attention.backend import AttentionCGSupport
+            # TQ attention runs Python-level encode/decode around the
+            # kernels (lazy quantizer init, tq.encode, block bookkeeping)
+            # that CANNOT run under CUDA graph capture — without declaring
+            # NEVER, piecewise capture dies with
+            # cudaErrorStreamCaptureInvalidated at engine init. NEVER makes
+            # vLLM put graph breaks around attention (MLP/norm/embedding
+            # still capture); attention runs eagerly.
+            try:
+                from vllm.v1.attention.backend import AttentionCGSupport
 
-            class TQMetadataBuilder(TritonAttentionMetadataBuilder):
-                # TQ attention uses custom Triton kernels with Python-level
-                # pre/post processing (rotation matmul, even/odd split,
-                # interleave, inverse rotation) that cannot be replayed
-                # from a captured CUDA graph.  Returning NEVER tells vLLM
-                # to create graph breaks around attention layers so that
-                # torch.compile + piecewise CUDA graphs still capture
-                # MLP / norm / embedding while attention runs eagerly.
-                _cudagraph_support = AttentionCGSupport.NEVER
+                class TQMetadataBuilder(TritonAttentionMetadataBuilder):
+                    _cudagraph_support = AttentionCGSupport.NEVER
 
-            return TQMetadataBuilder
+                return TQMetadataBuilder
+            except ImportError:
+                return TritonAttentionMetadataBuilder
 
         @staticmethod
         def get_kv_cache_shape(num_blocks, block_size, num_kv_heads,
@@ -362,10 +771,24 @@ def _make_impl_class():
         _prefill_v_buf: ClassVar[Optional[torch.Tensor]] = None
         _PREFILL_BUF_BLOCKS: ClassVar[int] = 512  # enough for ~8K token prefill
         _tq_quantizer: ClassVar[Optional[object]] = None
-        # PRIMARY mode: separate float32 norm tensors (avoids .contiguous().view()
-        # on the uint8 cache which copies 10+ MB per layer per forward)
-        _primary_k_norms: ClassVar[Optional[torch.Tensor]] = None
-        _primary_v_norms: ClassVar[Optional[torch.Tensor]] = None
+        # True once vLLM has driven KV writes through do_kv_cache_update()
+        # (unified_kv_cache_update splitting op). When set, _forward_primary
+        # skips its inline write — the hook already wrote this step's K/V.
+        _kv_update_hook_seen: ClassVar[bool] = False
+        # (layout validation is per-INSTANCE — heterogeneous models have
+        # per-layer head sizes, so a single class-level flag would let a
+        # mismatched layer ride a sibling layer validation)
+        # PRIMARY mode: per-layer kv_cache tensor registry (layer_idx -> tensor)
+        # so the DDR5 cold tier can spill any block across all layers.
+        _primary_kv_caches: ClassVar[dict] = {}
+        # PRIMARY mode DDR5 cold tier (spill-on-free target), init on layer 0.
+        _primary_cold_tier: ClassVar[Optional[object]] = None
+        # PRIMARY mode: separate float32 norms, {layer_idx: [blocks, bs, H]}
+        # (avoids .contiguous().view() on the uint8 cache which copies
+        # 10+ MB per layer per forward; dict-of-tensors so heterogeneous
+        # per-layer shapes are safe)
+        _primary_k_norms: ClassVar[Optional[dict]] = None
+        _primary_v_norms: ClassVar[Optional[dict]] = None
 
         # Decode decompression buffers (reused across calls, allocated once)
         # Shape: [num_blocks, block_size, num_kv_heads, head_dim]
@@ -407,6 +830,26 @@ def _make_impl_class():
             self._tq_layer_idx = TurboQuantImpl._tq_layer_counter
             TurboQuantImpl._tq_layer_counter += 1
             self._fused_attn = None
+            # The fused TQ decode kernel implements plain causal GQA only —
+            # no sliding window, no logits softcap, no attention sinks.
+            # Layers needing any of those must take the decompress →
+            # unified_attention path, which honors all three.
+            sw = getattr(self, "sliding_window", None)
+            if isinstance(sw, (list, tuple)):
+                has_sw = any(int(x) != -1 for x in sw)
+            else:
+                has_sw = sw not in (None, -1)
+            softcap = getattr(self, "logits_soft_cap", None)
+            self._tq_exact_attn_only = bool(
+                has_sw or softcap not in (None, 0, 0.0)
+                or getattr(self, "sinks", None) is not None)
+            if self._tq_exact_attn_only:
+                logger.info(
+                    "TurboQuantImpl[L%d]: exact-attention-only layer "
+                    "(sliding_window=%s softcap=%s sinks=%s) — fused TQ "
+                    "decode disabled, using decompress path",
+                    self._tq_layer_idx, sw, softcap,
+                    getattr(self, "sinks", None) is not None)
             if self._tq_primary:
                 mode = "PRIMARY"
                 if self._fused_enabled:
@@ -422,52 +865,6 @@ def _make_impl_class():
             )
 
         @torch.compiler.disable
-        def do_kv_cache_update(self, layer, key, value, kv_cache,
-                               slot_mapping):
-            """TQ-aware KV cache update, called via unified_kv_cache_update.
-
-            This runs as a graph-break splitting op so the CUDA graph
-            structure matches vLLM's expectations (same break points as
-            standard attention backends).
-            """
-            if self._is_draft or key is None or value is None:
-                return
-
-            if not self._tq_primary:
-                # SHADOW mode: parent handles standard KV write
-                return
-
-            packed_dim = self.head_size // 2
-            key_cache = kv_cache[:, 0]
-            value_cache = kv_cache[:, 1]
-            num_blocks = key_cache.shape[0]
-            block_size = key_cache.shape[1]
-            num_layers = TurboQuantImpl._tq_layer_counter
-
-            # Lazy-init norm tensors (once)
-            if TurboQuantImpl._primary_k_norms is None:
-                TurboQuantImpl._primary_k_norms = torch.zeros(
-                    num_layers, num_blocks, block_size, self.num_kv_heads,
-                    dtype=torch.float32, device=kv_cache.device)
-                TurboQuantImpl._primary_v_norms = torch.zeros(
-                    num_layers, num_blocks, block_size, self.num_kv_heads,
-                    dtype=torch.float32, device=kv_cache.device)
-                logger.info("[TQ] Primary norms: [%d layers, %d blocks, bs=%d, "
-                            "%d heads] (%.1f MB)", num_layers, num_blocks,
-                            block_size, self.num_kv_heads,
-                            num_layers * num_blocks * block_size
-                            * self.num_kv_heads * 4 * 2 / (1024 ** 2))
-
-            try:
-                self._tq_write_primary(
-                    key, value, key_cache, value_cache,
-                    slot_mapping, packed_dim)
-            except Exception as e:
-                import sys
-                print(f"[TQ] do_kv_cache_update error L{self._tq_layer_idx}: "
-                      f"{e}", file=sys.stderr, flush=True)
-
-        @torch.compiler.disable
         def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                     output=None, output_scale=None, output_block_scale=None):
             # Draft model layers (speculative decoding): pure passthrough to
@@ -477,6 +874,32 @@ def _make_impl_class():
                     layer, query, key, value, kv_cache, attn_metadata,
                     output=output, output_scale=output_scale,
                     output_block_scale=output_block_scale)
+
+            # CUDA graph capture guard.
+            # @torch.compiler.disable ensures this runs eagerly in piecewise
+            # mode, so the guard below should rarely fire. Safety net only.
+            # SHADOW: delegate to parent's fp8 path (CUDA graphs work normally).
+            # PRIMARY decode: delegate to _primary_decode_graphable (NOT disabled,
+            #   so piecewise CUDA graphs CAN capture the Triton kernel).
+            if torch.cuda.is_current_stream_capturing():
+                if self._tq_primary:
+                    # During graph capture, run the graphable decode stub.
+                    # The Triton kernel is pure tensor ops — fully capturable.
+                    if (output is not None
+                            and self._fused_attn is not None
+                            and hasattr(attn_metadata, "max_query_len")
+                            and attn_metadata.max_query_len == 1):
+                        return self._primary_decode_graphable(
+                            query, kv_cache, attn_metadata, output)
+                    # Prefill or no fused attn yet — return zeros (safe no-op)
+                    if output is not None:
+                        output.fill_(0)
+                    return output
+                return super().forward(
+                    layer, query, key, value, kv_cache, attn_metadata,
+                    output=output, output_scale=output_scale,
+                    output_block_scale=output_block_scale,
+                )
 
             if attn_metadata is None:
                 # Profiling run -- output must exist and be zeroed
@@ -516,14 +939,15 @@ def _make_impl_class():
                         )
                     else:
                         # Uniform mode: fused Triton kernel
-                        from .fused_kv_update import fused_encode_and_store
+                        from aither_kvcache.fused_kv_update import fused_encode_and_store
                         fused_encode_and_store(
                             tq_cache, self._tq_layer_idx, key, value,
                             attn_metadata.slot_mapping,
                         )
                     if self._tq_layer_idx == 0:
+                        request_id = getattr(attn_metadata, "request_id", None)
                         self._register_new_blocks(
-                            attn_metadata.slot_mapping, tq_cache)
+                            attn_metadata.slot_mapping, tq_cache, request_id)
                 except Exception as e:
                     import sys
                     print(f"[TQ] encode error L{self._tq_layer_idx}: {e}",
@@ -532,6 +956,7 @@ def _make_impl_class():
             # -- Decode path: fused TQ kernel (single-token generation) --
             is_decode = (
                 self._fused_enabled
+                and not self._tq_exact_attn_only
                 and tq_cache is not None
                 and hasattr(attn_metadata, "max_query_len")
                 and attn_metadata.max_query_len == 1
@@ -574,7 +999,7 @@ def _make_impl_class():
             """
             if self._fused_attn is not None:
                 return
-            from .fused_attention import TQPagedAttention
+            from turboquant.fused_attention import TQPagedAttention
             tq = None
             if TurboQuantImpl._tq_gpu_cache is not None:
                 tq = TurboQuantImpl._tq_gpu_cache.tq
@@ -602,6 +1027,22 @@ def _make_impl_class():
                 num_kv_heads=self.num_kv_heads,
             )
 
+            # Track which blocks were accessed during this attention pass
+            # for recency-based eviction and cold-tier warming (opt-in).
+            if os.environ.get("AITHER_TQ_ATTENTION_TRACKING", "0") == "1":
+                try:
+                    from aither_kvcache.block_metadata import (
+                        get_block_metadata_table,
+                    )
+                    table = get_block_metadata_table()
+                    _update_attended_blocks(
+                        attn_metadata.block_table,
+                        attn_metadata.seq_lens,
+                        table,
+                    )
+                except Exception as e:
+                    logger.debug("Attention tracking error: %s", e)
+
             output[:] = fused_out
             return output
 
@@ -624,12 +1065,12 @@ def _make_impl_class():
 
             # Determine packed_dim for VRAM budget calculation
             if tq_mode in ("tq35", "tq25"):
-                from .hybrid_quantizer import HybridTurboQuant
+                from aither_kvcache.hybrid_quantizer import HybridTurboQuant
                 pd = HybridTurboQuant.packed_dim_for_mode(self.head_size, tq_mode)
                 # Hybrid packs norms inside -- no separate +4 bytes
                 bytes_per_block = 2 * num_layers * block_size * self.num_kv_heads * pd
             else:
-                from .packing import packed_size
+                from turboquant.packing import packed_size
                 pd = packed_size(self.head_size, bits)
                 bytes_per_block = 2 * num_layers * block_size * self.num_kv_heads * (pd + 4)
             try:
@@ -674,8 +1115,8 @@ def _make_impl_class():
                 return
 
             try:
-                from .tier_cache_bridge import get_tier_cache_bridge
-                from .block_metadata import get_block_metadata_table
+                from aither_kvcache.tier_cache_bridge import get_tier_cache_bridge
+                from aither_kvcache.block_metadata import get_block_metadata_table
                 bridge = get_tier_cache_bridge()
                 bridge.configure(TurboQuantImpl._tq_gpu_cache)
                 logger.info("TierCacheBridge configured (%d blocks, %d layers)",
@@ -685,7 +1126,7 @@ def _make_impl_class():
                 logger.debug("TierCacheBridge init: %s", e)
 
         @staticmethod
-        def _register_new_blocks(slot_mapping, tq_cache):
+        def _register_new_blocks(slot_mapping, tq_cache, request_id=None):
             try:
                 valid = slot_mapping[slot_mapping >= 0]
                 if valid.numel() == 0:
@@ -695,18 +1136,233 @@ def _make_impl_class():
                               if b not in TurboQuantImpl._registered_blocks]
                 if not new_blocks:
                     return
-                from .block_metadata import get_block_metadata_table
+                from aither_kvcache.block_metadata import get_block_metadata_table
+                # Resolve tenant: per-request > instance > platform
+                tenant_slug = _resolve_request_tenant(request_id)
                 get_block_metadata_table().register_blocks(
                     block_indices=new_blocks, source_layer="kv_cache",
-                    importance=0.5, token_range=(0, 0), tenant_slug="platform",
+                    importance=0.5, token_range=(0, 0),
+                    tenant_slug=tenant_slug,
                 )
                 TurboQuantImpl._registered_blocks.update(new_blocks)
-            except Exception:
-                pass
+            except (RuntimeError, AttributeError, ImportError, ValueError) as e:
+                logger.debug("block registration skipped: %s", e)
 
         # ============================================================
         # PRIMARY MODE: TQ IS the KV cache
         # ============================================================
+
+        # ============================================================
+        # PRIMARY MODE: layout gate, norms, KV-update hook, cold tier
+        # ============================================================
+
+        def _expected_tq_dim(self) -> int:
+            """Last-axis size the uint8 PRIMARY cache must have for this head."""
+            tq_mode = os.environ.get("AITHER_TQ_MODE", "").replace("-primary", "")
+            if tq_mode in ("tq35", "tq25"):
+                from aither_kvcache.hybrid_quantizer import HybridTurboQuant
+                return HybridTurboQuant.packed_dim_for_mode(
+                    self.head_size, tq_mode)
+            from turboquant.packing import packed_size
+            bits = int(os.environ.get("AITHER_TQ_BITS", "4") or "4")
+            return packed_size(self.head_size, bits) + 4
+
+        def _ensure_primary_cache_layout(self, kv_cache):
+            """FAIL-CLOSED gate: refuse to serve if the cache is not TQ layout.
+
+            The D-395 gibberish came from exactly this state: PRIMARY armed
+            via AITHER_TQ_MODE while the engine patches (page_size + uint8
+            reshape) never ran, so uint8 packed nibbles were cast-written
+            into a bf16 cache and dequant read float garbage. Registered !=
+            active != correct — this is the "active" gate, enforced in code.
+            """
+            if getattr(self, "_tq_layout_ok", False):
+                return
+            tq_dim = self._expected_tq_dim()
+            if (kv_cache.dtype != torch.uint8 or kv_cache.dim() != 5
+                    or kv_cache.shape[1] != 2
+                    or kv_cache.shape[-1] != tq_dim):
+                raise RuntimeError(
+                    f"[TQ] PRIMARY mode is armed (AITHER_TQ_MODE="
+                    f"{os.environ.get('AITHER_TQ_MODE', '')!r}) but this "
+                    f"layer's KV cache is dtype={kv_cache.dtype}, shape="
+                    f"{tuple(kv_cache.shape)} — expected uint8 [blocks, 2, "
+                    f"block_size, kv_heads, tq_dim={tq_dim}]. The TQ engine "
+                    f"patches (page_size + uint8 reshape) did not run in "
+                    f"this process, so serving would generate pure gibberish"
+                    f" (D-395). Refusing to serve. Fix: ensure the "
+                    f"aither-kvcache plugin applied apply_tq_patches() "
+                    f"(AITHER_TQ_BITS set, vllm.general_plugins loaded, "
+                    f"AITHER_TQ_RESHAPE not disabled), or unset "
+                    f"AITHER_TQ_MODE to run the stock attention path.")
+            self._tq_layout_ok = True
+            if self._tq_layer_idx != 0:
+                return
+            import sys
+            msg = (f"[TQ] PRIMARY cache layout verified: uint8 "
+                   f"{tuple(kv_cache.shape)} (tq_dim={tq_dim})")
+            logger.info(msg)
+            print(msg, file=sys.stderr, flush=True)
+
+        def _ensure_primary_norms(self, kv_cache):
+            """Lazily allocate this layer f32 norm tensors (once per layer).
+
+            Stored as {layer_idx: [blocks, block_size, kv_heads]} dicts so
+            heterogeneous models (per-layer head/kv dims, e.g. gemma4) each
+            get correctly-shaped norms; consumers index [li] either way.
+            """
+            if TurboQuantImpl._primary_k_norms is None:
+                TurboQuantImpl._primary_k_norms = {}
+                TurboQuantImpl._primary_v_norms = {}
+            li = self._tq_layer_idx
+            if li in TurboQuantImpl._primary_k_norms:
+                return
+            num_blocks = kv_cache.shape[0]
+            block_size = kv_cache.shape[2]
+            TurboQuantImpl._primary_k_norms[li] = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads,
+                dtype=torch.float32, device=kv_cache.device)
+            TurboQuantImpl._primary_v_norms[li] = torch.zeros(
+                num_blocks, block_size, self.num_kv_heads,
+                dtype=torch.float32, device=kv_cache.device)
+            if li == 0:
+                num_layers = TurboQuantImpl._tq_layer_counter
+                logger.info(
+                    "[TQ] Primary norms: [%d layers x %d blocks, bs=%d, "
+                    "%d heads] (%.1f MB)", num_layers, num_blocks,
+                    block_size, self.num_kv_heads,
+                    num_layers * num_blocks * block_size * self.num_kv_heads
+                    * 4 * 2 / (1024 ** 2))
+
+        def _register_primary_cache(self, kv_cache):
+            """Track each layer's cache tensor for the DDR5 cold tier."""
+            if self._tq_layer_idx >= 0:
+                TurboQuantImpl._primary_kv_caches.setdefault(
+                    self._tq_layer_idx, kv_cache)
+
+        def _maybe_init_primary_cold_tier(self, kv_cache):
+            """Arm the DDR5 spill tier for the PRIMARY cache (once, layer 0)."""
+            if (TurboQuantImpl._primary_cold_tier is not None
+                    or self._tq_layer_idx != 0):
+                return
+            if os.environ.get("AITHER_TQ_COLD_TIER", "1") != "1":
+                return
+            try:
+                num_blocks = kv_cache.shape[0]
+                block_size = kv_cache.shape[2]
+                tq_dim = kv_cache.shape[-1]
+                num_layers = TurboQuantImpl._tq_layer_counter
+                tq_mode = os.environ.get(
+                    "AITHER_TQ_MODE", "").replace("-primary", "")
+                is_hybrid = tq_mode in ("tq35", "tq25")
+                cold_blocks = compute_cold_max_blocks(
+                    num_layers, block_size, self.num_kv_heads,
+                    tq_dim if is_hybrid else tq_dim - 4, is_hybrid)
+                if cold_blocks is None:
+                    # No AITHER_TQ_DDR5_BUDGET_GB set: default to a 4 GB
+                    # host-RAM budget. Never default to a full mirror — with
+                    # the page-size patch the block count inflates 2-4x and a
+                    # full mirror can silently pin tens of GB of DDR5.
+                    cold_blocks = compute_cold_max_blocks(
+                        num_layers, block_size, self.num_kv_heads,
+                        tq_dim if is_hybrid else tq_dim - 4, is_hybrid,
+                        ddr5_budget_gb=4.0)
+                cold_blocks = max(16, min(cold_blocks, num_blocks))
+                try:
+                    can_pin = (torch.cuda.is_available()
+                               and torch.zeros(1).pin_memory().is_pinned())
+                except Exception:
+                    can_pin = False  # WSL2: pinned memory segfaults
+                TurboQuantImpl._primary_cold_tier = TQPrimaryColdTier(
+                    num_layers=num_layers, block_size=block_size,
+                    num_kv_heads=self.num_kv_heads, tq_dim=tq_dim,
+                    cold_blocks=cold_blocks, can_pin=can_pin)
+                vram_mb = (num_blocks * 2 * block_size * self.num_kv_heads
+                           * tq_dim * num_layers) / (1024 ** 2)
+                cold_mb = (cold_blocks * 2 * block_size * self.num_kv_heads
+                           * (tq_dim + 8) * num_layers) / (1024 ** 2)
+                mode_label = (tq_mode or "tq4").upper()
+                # Same arming signature TQGPUCache logs in SHADOW mode —
+                # fleet runbooks grep for "TQGPUCache .* MB VRAM \+ .* MB DDR5".
+                # Printed to stderr as well: vLLM's logging config swallows
+                # the aither.* loggers, and an arming gate that is invisible
+                # in `docker logs` fails the fleet verification runbook.
+                import sys
+                msg = (f"TQGPUCache: {num_layers} layers x {num_blocks} "
+                       f"blocks @ {mode_label}-PRIMARY, {vram_mb:.0f} MB "
+                       f"VRAM + {cold_mb:.0f} MB DDR5 "
+                       f"(cold={cold_blocks} blocks)")
+                logger.info(msg)
+                print(msg, file=sys.stderr, flush=True)
+            except Exception as e:
+                import sys
+                print(f"[TQ] primary cold tier init FAILED — DDR5 spill "
+                      f"tier will be INERT this process: {e}",
+                      file=sys.stderr, flush=True)
+                logger.error("[TQ] primary cold tier init failed: %s", e)
+
+        @torch.compiler.disable
+        def do_kv_cache_update(self, layer, key, value, kv_cache,
+                               slot_mapping):
+            """KV-update hook (unified_kv_cache_update splitting op).
+
+            On vLLM builds whose Triton backend declares
+            forward_includes_kv_cache_update=False (Aitherium 0.19.1 fork),
+            this is THE KV write path — forward() never writes. SHADOW and
+            draft layers must delegate to the parent's standard write (the
+            old early-return silently dropped every KV write); PRIMARY
+            performs the TQ packed write after the fail-closed layout gate.
+            """
+            TurboQuantImpl._kv_update_hook_seen = True
+
+            if self._is_draft or not self._tq_primary:
+                parent = getattr(super(), "do_kv_cache_update", None)
+                if parent is not None:
+                    return parent(layer, key, value, kv_cache, slot_mapping)
+                return None
+
+            if (key is None or value is None or kv_cache is None
+                    or kv_cache.numel() == 0):
+                return None
+
+            # Fail-closed: raises (and kills the engine loudly) if the cache
+            # is not the uint8 TQ layout. Deliberately NOT caught here.
+            self._ensure_primary_cache_layout(kv_cache)
+            self._ensure_primary_norms(kv_cache)
+            self._register_primary_cache(kv_cache)
+            self._maybe_init_primary_cold_tier(kv_cache)
+
+            # A failed KV write means this step's tokens are MISSING from
+            # the cache — forward() skips its inline write because the hook
+            # is active, so swallowing here silently degrades generation
+            # (the D-395 genre; review finding). Log loudly and PROPAGATE:
+            # a dead engine beats quietly-wrong output.
+            try:
+                self._tq_write_primary(
+                    key, value, kv_cache[:, 0], kv_cache[:, 1],
+                    slot_mapping, self.head_size // 2)
+            except Exception as e:
+                import sys
+                print(f"[TQ] primary hook write FAILED L{self._tq_layer_idx}"
+                      f": {e} — propagating (missing KV = wrong output)",
+                      file=sys.stderr, flush=True)
+                raise
+
+        def _tq_extra_attn_kwargs(self, attn_metadata) -> dict:
+            """Version-tolerant extras for unified_attention.
+
+            mm_prefix_range (partial multimodal full attention) and sinks
+            exist only on newer vLLMs; pass them through only when present
+            so the same code runs on the 0.19.1 fork and the 0.23 nightly.
+            """
+            extra = {}
+            mm = getattr(attn_metadata, "mm_prefix_range_tensor", None)
+            if mm is not None:
+                extra["mm_prefix_range"] = mm
+            sinks = getattr(self, "sinks", None)
+            if sinks is not None:
+                extra["sinks"] = sinks
+            return extra
 
         def _forward_primary(self, layer, query, key, value, kv_cache,
                              attn_metadata, output, output_scale):
@@ -736,18 +1392,21 @@ def _make_impl_class():
                     and value.shape[1] == self.num_heads):
                 query, value = value, query
 
-            # --- Allocate separate float32 norm tensors (once, per-layer) ---
+            # --- Fail-closed layout gate + shared PRIMARY state ---
+            self._ensure_primary_cache_layout(kv_cache)
+            self._ensure_primary_norms(kv_cache)
+            self._register_primary_cache(kv_cache)
+            self._maybe_init_primary_cold_tier(kv_cache)
+
             key_cache = kv_cache[:, 0]    # [blocks, block_size, heads, tq_dim]
             value_cache = kv_cache[:, 1]
             num_blocks = key_cache.shape[0]
-            key_cache.shape[1]
-            # Norms are initialized in do_kv_cache_update (called first).
 
             # Lazy-init block selector for sparse attention
             if (TurboQuantImpl._block_selector is None
                     and TurboQuantImpl._block_select_ratio < 1.0
                     and TurboQuantImpl._tq_quantizer is not None):
-                from .block_selector import BlockSelector
+                from aither_kvcache.block_selector import BlockSelector
                 half_d = self.head_size // 2
                 TurboQuantImpl._block_selector = BlockSelector(
                     max_blocks=num_blocks,
@@ -769,10 +1428,22 @@ def _make_impl_class():
                     TurboQuantImpl._block_select_recent,
                     TurboQuantImpl._block_select_min)
 
-            # KV write is now handled by do_kv_cache_update() (called via
-            # unified_kv_cache_update splitting op before forward).
+            # Inline write only when vLLM has NOT routed this step's KV write
+            # through do_kv_cache_update() (older/newer engines without the
+            # splitting op). When the hook is active, it already wrote —
+            # writing again here would be redundant (identical bytes) work.
+            if (key is not None and value is not None
+                    and not TurboQuantImpl._kv_update_hook_seen):
+                try:
+                    self._tq_write_primary(
+                        key, value, key_cache, value_cache,
+                        attn_metadata.slot_mapping, packed_dim)
+                except Exception as e:
+                    import sys
+                    print(f"[TQ] primary write error L{self._tq_layer_idx}: {e}",
+                          file=sys.stderr, flush=True)
 
-            # --- Compute attention ---
+            # --- Step 2: Compute attention ---
             is_decode = (
                 hasattr(attn_metadata, "max_query_len")
                 and attn_metadata.max_query_len == 1
@@ -803,7 +1474,7 @@ def _make_impl_class():
             """
             # Get or lazily create TQ quantizer
             if TurboQuantImpl._tq_quantizer is None:
-                from .quantizer import TurboQuant
+                from turboquant import TurboQuant
                 TurboQuantImpl._tq_quantizer = TurboQuant(
                     head_dim=self.head_size, bits=4,
                     device=str(key.device))
@@ -851,8 +1522,8 @@ def _make_impl_class():
             li = self._tq_layer_idx
             kn_f32 = kn.reshape(N, H).to(torch.float32)
             vn_f32 = vn.reshape(N, H).to(torch.float32)
-            TurboQuantImpl._primary_k_norms[li, bi, oi] = kn_f32
-            TurboQuantImpl._primary_v_norms[li, bi, oi] = vn_f32
+            TurboQuantImpl._primary_k_norms[li][bi, oi] = kn_f32
+            TurboQuantImpl._primary_v_norms[li][bi, oi] = vn_f32
 
             # Update block representatives for sparse attention (layer 0 only)
             if li == 0 and TurboQuantImpl._block_selector is not None:
@@ -884,7 +1555,7 @@ def _make_impl_class():
             num_actual_tokens = attn_metadata.num_actual_tokens
 
             fused_out = self._fused_attn.forward(
-                query=query[:num_actual_tokens].to(torch.float32),
+                query=query[:num_actual_tokens],
                 k_packed=key_cache[:, :, :, :packed_dim],
                 k_norms=TurboQuantImpl._primary_k_norms[li],
                 v_packed=value_cache[:, :, :, :packed_dim],
@@ -920,16 +1591,19 @@ def _make_impl_class():
 
             Expected throughput: 50-70 tok/s (up from 8-23 with decompress).
             """
-            self.head_size // 2
-            key_cache = kv_cache[:, 0]      # [B, bs, H, tq_dim] uint8
-            kv_cache[:, 1]
-            key_cache.shape[0]
-            key_cache.shape[1]
             li = self._tq_layer_idx
+
+            if self._tq_exact_attn_only:
+                # Sliding-window / softcap / sink layers: the fused kernel
+                # would silently compute WRONG attention. Decompress and let
+                # unified_attention apply the exact semantics.
+                return self._forward_primary_decode_slow(
+                    layer, query, key, value, kv_cache, attn_metadata,
+                    output, output_scale, output_block_scale)
 
             # Ensure TQ quantizer + fused attention exist
             if TurboQuantImpl._tq_quantizer is None:
-                from .quantizer import TurboQuant
+                from turboquant import TurboQuant
                 TurboQuantImpl._tq_quantizer = TurboQuant(
                     head_dim=self.head_size, bits=4,
                     device=str(query.device))
@@ -1032,6 +1706,7 @@ def _make_impl_class():
                 q_descale=None,
                 k_descale=ones_descale,
                 v_descale=ones_descale,
+                **self._tq_extra_attn_kwargs(attn_metadata),
             )
 
             output[:num_actual_tokens] = out_buf.to(output.dtype)
@@ -1069,8 +1744,8 @@ def _make_impl_class():
 
             # Gather norms from per-layer float32 tensors
             li = self._tq_layer_idx
-            k_norms_active = TurboQuantImpl._primary_k_norms[li, active]  # [A, bs, heads]
-            v_norms_active = TurboQuantImpl._primary_v_norms[li, active]
+            k_norms_active = TurboQuantImpl._primary_k_norms[li][active]  # [A, bs, heads]
+            v_norms_active = TurboQuantImpl._primary_v_norms[li][active]
 
             # Flatten for batch decode: [A * bs * heads, packed_dim]
             A = active.shape[0]
@@ -1118,7 +1793,7 @@ def _make_impl_class():
                 output_scale: optional output scaling
                 packed_dim: number of packed index bytes
             """
-            from .quantizer import TurboQuant
+            from turboquant import TurboQuant
 
             # Ensure quantizer exists
             if TurboQuantImpl._tq_quantizer is None:
@@ -1165,8 +1840,8 @@ def _make_impl_class():
                 kp_all = key_cache[active_blocks, :, :, :packed_dim]  # [A, bs, H, pd]
                 vp_all = value_cache[active_blocks, :, :, :packed_dim]
                 li = self._tq_layer_idx
-                kn_all = TurboQuantImpl._primary_k_norms[li, active_blocks]  # [A, bs, H]
-                vn_all = TurboQuantImpl._primary_v_norms[li, active_blocks]
+                kn_all = TurboQuantImpl._primary_k_norms[li][active_blocks]  # [A, bs, H]
+                vn_all = TurboQuantImpl._primary_v_norms[li][active_blocks]
 
                 # Flatten and decode in one call
                 flat_kp = kp_all.reshape(A * block_size * H, packed_dim)
@@ -1238,6 +1913,7 @@ def _make_impl_class():
                 q_descale=None,
                 k_descale=ones_descale,
                 v_descale=ones_descale,
+                **self._tq_extra_attn_kwargs(attn_metadata),
             )
 
             output[:num_actual_tokens] = out_buf.to(output.dtype)

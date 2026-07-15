@@ -23,7 +23,7 @@ import torch
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from .codebook import get_codebook, get_theory_bounds
+from .codebook import get_codebook, get_theory_bounds, get_correction_factors
 from .rotation import random_orthogonal, randomized_hadamard_matrix
 from .packing import (
     pack_4bit, unpack_4bit,
@@ -101,6 +101,12 @@ class TurboQuant:
 
         # Theory bounds
         self.theory_lower, self.theory_upper = get_theory_bounds(config.bits)
+
+        # Per-centroid correction factors for unbiased inner product estimation
+        correction_np = get_correction_factors(config.head_dim, config.bits)
+        self.correction_factors = torch.tensor(
+            correction_np, dtype=torch.float32, device=config.device,
+        )
 
         # Pack/unpack dispatch
         self._pack_fn = {2: pack_2bit, 3: pack_3bit, 4: pack_4bit}[config.bits]
@@ -211,6 +217,12 @@ class TurboQuant:
         indices = self._unpack_fn(packed, self.head_dim)
         return self.centroids[indices.long()]
 
+    def _pytorch_decode_corrected(self, packed: torch.Tensor) -> torch.Tensor:
+        """Unpack + codebook lookup with per-centroid IP bias correction."""
+        indices = self._unpack_fn(packed, self.head_dim)
+        idx_long = indices.long()
+        return self.centroids[idx_long] * self.correction_factors[idx_long]
+
     # ================================================================
     # INTERNAL: Triton path (GPU only)
     # ================================================================
@@ -295,6 +307,16 @@ class TurboQuant:
         ip_mse = (true_ip - est_ip).pow(2).mean().item()
         ip_bias = (est_ip - true_ip).mean().item()
 
+        # Corrected decode: apply per-centroid bias correction factors
+        packed_flat = packed.reshape(-1, packed.shape[-1])
+        norms_flat = norms.reshape(-1).float()
+        y_hat_corr = self._pytorch_decode_corrected(packed_flat)
+        x_hat_corr = torch.matmul(y_hat_corr, self.rotation)
+        x_hat_corr = x_hat_corr * norms_flat.unsqueeze(-1)
+        x_hat_corr = x_hat_corr.reshape(x.shape)
+        est_ip_corr = (x_hat_corr[idx_a] * x[idx_b]).sum(dim=-1)
+        ip_bias_corrected = (est_ip_corr - true_ip).mean().item()
+
         # Max absolute error
         max_err = (x - x_hat).abs().max().item()
 
@@ -308,6 +330,7 @@ class TurboQuant:
             "mse_ratio_to_lower": mse / self.theory_lower if self.theory_lower > 0 else float("inf"),
             "ip_mse": ip_mse,
             "ip_bias": ip_bias,
+            "ip_bias_corrected": ip_bias_corrected,
             "max_abs_error": max_err,
             "compression_vs_fp16": self.compression_ratio(),
             "compression_vs_fp8": self.compression_ratio_vs_fp8(),
