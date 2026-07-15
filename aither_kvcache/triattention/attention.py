@@ -142,7 +142,6 @@ class TriAttention:
             squeeze_q = True
 
         B, QH, S_q, D = query.shape
-        S_kv = key.shape[1]
 
         # Encode K/V
         k_enc, v_enc = self.encode_kv(key, value)
@@ -235,8 +234,6 @@ class TriAttention:
         """
         B, QH, S = weights.shape
         D = self.head_dim
-        KVH = self.num_kv_heads
-        F = v_enc.indices.shape[-1]
 
         # Unpack value coefficients
         v0, v1 = self.scorer._unpack_coefficients(v_enc)  # [B, S, KVH, F]
@@ -424,7 +421,6 @@ def _apply_rope(
     Returns:
         [..., head_dim] rotated vectors.
     """
-    D = x.shape[-1]
     x_float = x.float()
     x_even = x_float[..., 0::2]  # [..., D/2]
     x_odd = x_float[..., 1::2]   # [..., D/2]

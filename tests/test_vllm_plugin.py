@@ -6,8 +6,6 @@ through the cache layer. Does NOT require a running vLLM instance.
 """
 
 import pytest
-import torch
-from unittest.mock import MagicMock, patch
 
 
 class TestPluginRegistration:

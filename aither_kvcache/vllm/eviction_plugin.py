@@ -21,7 +21,6 @@ Or via plugin entry point (automatic if aither-kvcache is installed):
 
 import logging
 import threading
-from typing import Optional
 
 logger = logging.getLogger("aither.kvcache.eviction")
 

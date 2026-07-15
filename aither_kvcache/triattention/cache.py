@@ -31,7 +31,7 @@ import torch
 from typing import Optional, Tuple
 
 from .config import TriAttentionConfig
-from .encoder import SpectralKVEncoder, SpectralEncoding
+from .encoder import SpectralEncoding
 
 
 class SpectralKVCache:

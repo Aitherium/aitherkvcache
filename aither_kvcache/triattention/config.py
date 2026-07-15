@@ -6,7 +6,7 @@ adaptive schedules. Designed for Qwen3.5 family but generic enough
 for any RoPE-based transformer.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List
 
 

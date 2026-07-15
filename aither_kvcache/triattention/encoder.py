@@ -26,7 +26,6 @@ Decoding:
     3. Scatter pair values back to full head_dim vector
 """
 
-import math
 import torch
 from typing import Tuple, Optional, NamedTuple
 

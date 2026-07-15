@@ -135,8 +135,6 @@ class TrigSeriesScorer:
         """
         B, QH, D = query.shape
         S = k_enc.indices.shape[1]
-        KVH = k_enc.indices.shape[2]
-        F = k_enc.indices.shape[3]
         device = query.device
 
         # Default positions: 0, 1, 2, ..., S-1

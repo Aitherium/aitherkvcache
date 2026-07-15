@@ -17,7 +17,6 @@ from aither_kvcache.triattention.spectral import (
     pair_energies,
     topk_pairs,
     spectral_concentration,
-    pair_energy_profile,
     trig_series_coefficients,
     dct_matrix,
     dct,
@@ -29,9 +28,6 @@ from aither_kvcache.triattention.cache import SpectralKVCache
 from aither_kvcache.triattention.attention import TriAttention, _apply_rope
 from aither_kvcache.triattention.calibration import (
     QWEN3_5_PROFILES,
-    NEMOTRON_PROFILES,
-    DEEPSEEK_PROFILES,
-    LLAMA_PROFILES,
     ALL_PROFILES,
     get_profile,
     get_config_for_model,

@@ -8,12 +8,11 @@ import pytest
 import torch
 import numpy as np
 
-from turboquant import TurboQuant
 from turboquant.packing import packed_size
 from aither_kvcache.persistence import (
     save_tqkv, load_tqkv, mmap_tqkv,
     _pack_header, _unpack_header,
-    MAGIC, FORMAT_VERSION, HEADER_SIZE,
+    HEADER_SIZE,
 )
 
 

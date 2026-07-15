@@ -25,7 +25,7 @@ Format (v1):
 
 import struct
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import numpy as np

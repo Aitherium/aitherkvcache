@@ -2,7 +2,6 @@
 Tests for BlockSelector (sparse block attention filtering).
 """
 
-import pytest
 import torch
 
 from aither_kvcache.block_selector import BlockRepresentativeCache, BlockSelector

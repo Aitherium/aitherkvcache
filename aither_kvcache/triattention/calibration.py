@@ -16,7 +16,10 @@ your own data for optimal per-layer tuning.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+if TYPE_CHECKING:
+    import torch
 
 from .config import TriAttentionConfig
 
@@ -393,7 +396,6 @@ def spectral_profile_sweep(
     Returns:
         Dict mapping num_freqs → mean energy ratio across samples.
     """
-    import torch
     from .spectral import spectral_concentration
 
     results = {}
