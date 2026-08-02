@@ -35,6 +35,7 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import sys
 import threading
 from typing import Any
@@ -64,6 +65,18 @@ _isolation_status: dict[str, bool] = {
     "key_present": False,
     "verified": False,
 }
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+def _is_safe_tenant_slug(tenant_slug: str) -> bool:
+    """Validate tenant_slug format — reject path traversal and special chars."""
+    if not tenant_slug or not isinstance(tenant_slug, str):
+        return False
+    # Match: lowercase alphanumeric start, then alphanumeric/underscore/dash
+    return bool(re.match(r"^[a-z0-9][a-z0-9_-]{0,62}$", tenant_slug))
 
 
 # ---------------------------------------------------------------------------
@@ -129,22 +142,53 @@ def extract_tenant_from_request_id(
 
 
 # ---------------------------------------------------------------------------
-# Block -> tenant map
+# Block -> tenant map (with KV warmth reporting)
 # ---------------------------------------------------------------------------
-def tag_blocks(tenant_slug: str, block_ids) -> None:
+def tag_blocks(tenant_slug: str, block_ids, session_id: str = "") -> None:
     if not tenant_slug or not block_ids:
+        return
+    # Validate tenant_slug format
+    if not _is_safe_tenant_slug(tenant_slug):
+        logger.warning("Rejecting block tag with unsafe tenant: %s", tenant_slug)
         return
     with _block_lock:
         for bid in block_ids:
             _block_tenant[int(bid)] = tenant_slug
 
+    # Report KV warmth allocation (non-fatal)
+    if session_id:
+        try:
+            from .kv_warmth_client import report_allocate
+            report_allocate(tenant_slug, session_id, len(block_ids))
+        except (ImportError, AttributeError):
+            pass  # Warmth reporting not available
 
-def untag_blocks(block_ids) -> None:
+
+def untag_blocks(block_ids, session_id: str = "", tenant_slug: str = "") -> None:
     if not block_ids:
+        return
+    # Require non-empty tenant_slug (fail-closed, never default to 'platform')
+    if not tenant_slug:
+        logger.warning("untag_blocks called with empty tenant_slug; skipping report")
+        # Still untag locally to avoid data corruption, but don't report
+        with _block_lock:
+            for bid in block_ids:
+                _block_tenant.pop(int(bid), None)
+        return
+    if not _is_safe_tenant_slug(tenant_slug):
+        logger.warning("Rejecting block untag with unsafe tenant: %s", tenant_slug)
         return
     with _block_lock:
         for bid in block_ids:
             _block_tenant.pop(int(bid), None)
+
+    # Report KV warmth free (non-fatal)
+    if session_id:
+        try:
+            from .kv_warmth_client import report_free
+            report_free(tenant_slug, session_id, len(block_ids))
+        except (ImportError, AttributeError):
+            pass  # Warmth reporting not available
 
 
 def block_tenant(block_id: int) -> str | None:
@@ -276,7 +320,9 @@ def _wrap_block_manager(cls: Any) -> bool:
                 rid = getattr(request, "request_id", None)
                 tenant, _orig = extract_tenant_from_request_id(rid)
                 if tenant:
-                    tag_blocks(tenant, _flatten_block_ids(self, rid))
+                    tag_blocks(
+                        tenant, _flatten_block_ids(self, rid), session_id=_orig
+                    )
             except Exception as e:  # never break allocation for tagging
                 logger.debug("tenant block-tag skipped: %s", e)
         return result
@@ -289,7 +335,11 @@ def _wrap_block_manager(cls: Any) -> bool:
             try:
                 rid = getattr(request, "request_id", None)
                 if rid:
-                    untag_blocks(_flatten_block_ids(self, rid))
+                    _tenant, _orig = extract_tenant_from_request_id(rid)
+                    untag_blocks(
+                        _flatten_block_ids(self, rid), session_id=_orig,
+                        tenant_slug=_tenant or "platform"
+                    )
             except Exception as e:
                 logger.debug("tenant block-untag skipped: %s", e)
             return free(self, request, *args, **kwargs)

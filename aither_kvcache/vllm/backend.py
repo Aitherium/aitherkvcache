@@ -1313,11 +1313,19 @@ def _make_impl_class():
             old early-return silently dropped every KV write); PRIMARY
             performs the TQ packed write after the fail-closed layout gate.
             """
+            # Kept for telemetry only. NOTHING may gate a write on this: it is
+            # latched by the first call from ANY layer (including a draft or
+            # SHADOW layer, which return below without writing a PRIMARY cache)
+            # and is never reset, so using it to suppress the inline write
+            # silently drops every KV write once any layer touches this method.
             TurboQuantImpl._kv_update_hook_seen = True
 
             if self._is_draft or not self._tq_primary:
                 parent = getattr(super(), "do_kv_cache_update", None)
                 if parent is not None:
+                    # The parent performed this layer's write, so the inline
+                    # write in forward() would be redundant for THIS layer.
+                    self._kv_hook_wrote = True
                     return parent(layer, key, value, kv_cache, slot_mapping)
                 return None
 
@@ -1341,6 +1349,10 @@ def _make_impl_class():
                 self._tq_write_primary(
                     key, value, kv_cache[:, 0], kv_cache[:, 1],
                     slot_mapping, self.head_size // 2)
+                # Consumed by _forward_primary for THIS layer, THIS step. Set
+                # only after the write actually succeeded — on the raise below
+                # it stays False so nothing records a write that did not happen.
+                self._kv_hook_wrote = True
             except Exception as e:
                 import sys
                 print(f"[TQ] primary hook write FAILED L{self._tq_layer_idx}"
@@ -1428,12 +1440,32 @@ def _make_impl_class():
                     TurboQuantImpl._block_select_recent,
                     TurboQuantImpl._block_select_min)
 
-            # Inline write only when vLLM has NOT routed this step's KV write
-            # through do_kv_cache_update() (older/newer engines without the
-            # splitting op). When the hook is active, it already wrote —
-            # writing again here would be redundant (identical bytes) work.
-            if (key is not None and value is not None
-                    and not TurboQuantImpl._kv_update_hook_seen):
+            # Inline write only when the hook has NOT already written THIS
+            # layer's KV for THIS step.
+            #
+            # This used to test the CLASS-level _kv_update_hook_seen, which is
+            # latched True by the FIRST do_kv_cache_update() call from ANY
+            # layer and never reset — and is set before that method's
+            # draft/non-primary early return, so a draft or SHADOW layer flips
+            # it for every PRIMARY layer too. Once latched, every inline write
+            # is skipped forever; if vLLM is then not routing through the
+            # splitting op, NOTHING writes the KV cache at all.
+            #
+            # That is not hypothetical: measured 2026-07-31, tq4-primary served
+            # "The capital of France is" -> " Paris!!!!!!!!!!!!!!". The first
+            # token is right because prefill attends the raw key/value it was
+            # handed; every later token attends an all-zero cache and collapses.
+            # The run had enforce_eager=True, compilation mode=NONE and
+            # splitting_ops=[] — i.e. no unified_kv_cache_update op existed to
+            # do the writing the latched flag had disabled.
+            #
+            # The flag must therefore be PER-LAYER and PER-STEP. _kv_hook_wrote
+            # is set by this layer's own hook call and consumed (reset) here, so
+            # a step where the hook did not run always falls back to the inline
+            # write instead of silently dropping it.
+            hook_wrote = getattr(self, "_kv_hook_wrote", False)
+            self._kv_hook_wrote = False
+            if key is not None and value is not None and not hook_wrote:
                 try:
                     self._tq_write_primary(
                         key, value, key_cache, value_cache,
