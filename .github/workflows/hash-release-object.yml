@@ -1,0 +1,115 @@
+# hash-release-object — compute a mirrored object's whole-file hashes in the cloud.
+#
+# SOURCE OF TRUTH lives HERE (monorepo). The deployed copy is
+# Aitherium/aitherkvcache:.github/workflows/hash-release-object.yml — that repo
+# is a regenerable mirror surface, so edit here and re-push via
+# `gh api -X PUT repos/Aitherium/aitherkvcache/contents/.github/workflows/...`.
+#
+# WHY THIS EXISTS: registering a Strata FROZEN reference is fail-closed — it
+# needs the whole-file sha256 (integrity) and blob_sha (the awgit content
+# address). For an object that was mirrored cloud-to-cloud, NOBODY EVER HELD
+# THE WHOLE FILE: the parts were Range-fetched straight from HuggingFace to the
+# release. Hashing it from home would mean pulling ~17GB back down a 30 Mbps
+# uplink (~75 min per model) to compute two hex strings. A runner does it in
+# minutes on a 10 Gbps link.
+#
+# STREAMS, never stores: the parts are concatenated through a pipe into the
+# hashers, so peak disk is ~0 and a 40GB object costs no more than a 5GB one.
+# (A runner has ~25GB free; storing qwen36-27b at 16.8GB would fit, deepseek's
+# 49.9GB shard would not.)
+name: Hash release object
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "Served asset base name (parts are <name>.partN)"
+        required: true
+      release:
+        description: "Release tag holding the parts"
+        required: true
+      expect_bytes:
+        description: "Expected total size in bytes (fail loud on mismatch)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  hash:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stream parts and hash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NAME='${{ inputs.name }}'
+          RELEASE='${{ inputs.release }}'
+          EXPECT='${{ inputs.expect_bytes }}'
+          REPO="$GITHUB_REPOSITORY"
+
+          # Part ORDER is the whole correctness question: `part10` sorts before
+          # `part2` lexically, so a plain sort of the asset list would hash the
+          # object in the wrong order and produce a confidently wrong digest.
+          # Sort NUMERICALLY on the part index.
+          mapfile -t PARTS < <(gh release view "$RELEASE" --repo "$REPO" \
+            --json assets --jq ".assets[].name | select(startswith(\"$NAME.part\"))" \
+            | sed "s/^$NAME\.part//" | sort -n | sed "s|^|$NAME.part|")
+          if [ "${#PARTS[@]}" -eq 0 ]; then
+            echo "::error::no parts found for $NAME in $RELEASE"; exit 1
+          fi
+          echo "parts in order: ${PARTS[*]}"
+
+          # The hasher goes in a FILE, not `python3 -c` and not a heredoc on
+          # stdin: the byte stream already owns stdin, so a heredoc cannot also
+          # use it. (YAML strips the block scalar's common indent, so the code
+          # below reaches python at column 0.)
+          cat > /tmp/hash_stream.py <<'PY'
+          import hashlib
+          import sys
+
+          # git-blob sha1 needs the LENGTH in its header BEFORE any content. The
+          # declared total lets us seed that header up front and stream both
+          # digests in ONE pass, holding nothing — buffering the object to learn
+          # its length would OOM a 7GB runner on anything past a few GB, which is
+          # the whole class of object this exists for. The size is VERIFIED after:
+          # if the stream did not deliver exactly this many bytes the seeded
+          # header was wrong, so blob_sha is meaningless and is withheld rather
+          # than printed as a plausible wrong hash.
+          expected = int(sys.argv[1])
+          sha = hashlib.sha256()
+          blob = hashlib.sha1()
+          blob.update(b"blob %d\0" % expected)
+          total = 0
+          while True:
+              chunk = sys.stdin.buffer.read(8 << 20)
+              if not chunk:
+                  break
+              sha.update(chunk)
+              blob.update(chunk)
+              total += len(chunk)
+          print("size_bytes=%d" % total)
+          print("sha256=%s" % sha.hexdigest())
+          print("blob_sha=%s" % (blob.hexdigest() if total == expected else ""))
+          PY
+
+          base="https://github.com/$REPO/releases/download/$RELEASE"
+          # One pipeline: every part concatenated into a single byte stream that
+          # both hashers consume. `set -o pipefail` makes a failed fetch fatal
+          # instead of silently hashing a truncated object.
+          for p in "${PARTS[@]}"; do
+            curl -sL --fail --connect-timeout 30 --max-time 1800 "$base/$p"
+          done | python3 /tmp/hash_stream.py "$EXPECT" | tee /tmp/hashes.txt
+
+          got=$(grep '^size_bytes=' /tmp/hashes.txt | cut -d= -f2)
+          if [ "$got" != "$EXPECT" ]; then
+            echo "::error::SIZE MISMATCH: streamed=$got expected=$EXPECT"; exit 1
+          fi
+
+          {
+            echo "## 🔐 $NAME"
+            echo '```'
+            cat /tmp/hashes.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
