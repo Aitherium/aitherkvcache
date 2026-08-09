@@ -1,0 +1,116 @@
+# mirror-hf-to-release — cloud-to-cloud weight mirror (awgit protocol lane).
+#
+# Fan-out: one runner per 1.9GB part. Each runner Range-fetches its byte-exact
+# slice straight from HuggingFace and uploads it as a release asset — the
+# origin box's uplink is never involved. 20 runners in parallel turn a 40GB
+# shard from ~2.5h (home uplink) into ~10 minutes.
+#
+# Resumable: the plan job skips parts already present in the release, so
+# re-dispatching after any failure uploads only what is missing.
+# Part naming matches the bonsai-weights worker CHUNKED manifest: <name>.partN
+name: Mirror HF weight to release
+
+on:
+  workflow_dispatch:
+    inputs:
+      hf_url:
+        description: "Full HF resolve URL of the source file"
+        required: true
+      name:
+        description: "Served asset base name (worker CHUNKED naming)"
+        required: true
+      total_bytes:
+        description: "Exact source size in bytes (verified against HF)"
+        required: true
+      release:
+        description: "Release tag to upload into"
+        required: true
+      part_size:
+        description: "Part size in bytes"
+        required: false
+        default: "1900000000"
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      missing: ${{ steps.plan.outputs.missing }}
+    steps:
+      - name: Verify source size and compute missing parts
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          HF_URL='${{ inputs.hf_url }}'
+          TOTAL='${{ inputs.total_bytes }}'
+          PART='${{ inputs.part_size }}'
+          NAME='${{ inputs.name }}'
+          RELEASE='${{ inputs.release }}'
+
+          # FAIL LOUD if HF's size does not match the declared total — a drifted
+          # source would slice garbage that stitches into corrupt weights.
+          hf_len=$(curl -sIL "$HF_URL" | grep -i '^content-length' | tail -1 | tr -dc '0-9')
+          if [ "$hf_len" != "$TOTAL" ]; then
+            echo "SIZE MISMATCH: HF=$hf_len declared=$TOTAL"; exit 1
+          fi
+
+          existing=$(gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' || true)
+
+          python3 - <<EOF >> "$GITHUB_OUTPUT"
+          import json, os
+          total, part = int("$TOTAL"), int("$PART")
+          name = "$NAME"
+          existing = set("""$existing""".split())
+          items = []
+          idx = pos = 0
+          while pos < total:
+              size = min(part, total - pos)
+              pname = f"{name}.part{idx}"
+              if pname not in existing:
+                  items.append({"idx": idx, "offset": pos, "size": size})
+              pos += size; idx += 1
+          print("matrix=" + json.dumps({"include": items}))
+          print("missing=" + str(len(items)))
+          EOF
+          echo "planned"
+
+  mirror:
+    needs: plan
+    if: needs.plan.outputs.missing != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+      max-parallel: 20
+      fail-fast: false
+    steps:
+      - name: Range-fetch part ${{ matrix.idx }} and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          HF_URL='${{ inputs.hf_url }}'
+          NAME='${{ inputs.name }}'
+          RELEASE='${{ inputs.release }}'
+          OFFSET='${{ matrix.offset }}'
+          SIZE='${{ matrix.size }}'
+          IDX='${{ matrix.idx }}'
+          END=$((OFFSET + SIZE - 1))
+          PART_FILE="${NAME}.part${IDX}"
+
+          for attempt in 1 2 3; do
+            curl -sL --fail -H "Range: bytes=${OFFSET}-${END}" -o "$PART_FILE" "$HF_URL" && break
+            echo "fetch attempt $attempt failed; retrying"; sleep 5
+          done
+          got=$(stat -c%s "$PART_FILE")
+          if [ "$got" != "$SIZE" ]; then
+            echo "PART SIZE MISMATCH: got=$got want=$SIZE"; exit 1
+          fi
+          sha256sum "$PART_FILE"
+          gh release upload "$RELEASE" "$PART_FILE" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "uploaded $PART_FILE ($SIZE bytes)"
