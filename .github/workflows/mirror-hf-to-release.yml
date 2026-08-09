@@ -1,5 +1,10 @@
 # mirror-hf-to-release — cloud-to-cloud weight mirror (awgit protocol lane).
 #
+# SOURCE OF TRUTH lives HERE (monorepo). The deployed copy is
+# Aitherium/aitherkvcache:.github/workflows/mirror-hf-to-release.yml — that repo
+# is a regenerable mirror surface, so edit here and re-push via
+# `gh api -X PUT repos/Aitherium/aitherkvcache/contents/.github/workflows/...`.
+#
 # Fan-out: one runner per 1.9GB part. Each runner Range-fetches its byte-exact
 # slice straight from HuggingFace and uploads it as a release asset — the
 # origin box's uplink is never involved. 20 runners in parallel turn a 40GB
@@ -103,9 +108,13 @@ jobs:
           END=$((OFFSET + SIZE - 1))
           PART_FILE="${NAME}.part${IDX}"
 
+          # --max-time bounds a STALLED transfer (a hung connection exits 28 and
+          # retries) — without it one stalled fetch hung a runner for 3h+ while
+          # every cheap signal said in_progress (measured 2026-08-09, part7).
           for attempt in 1 2 3; do
-            curl -sL --fail -H "Range: bytes=${OFFSET}-${END}" -o "$PART_FILE" "$HF_URL" && break
-            echo "fetch attempt $attempt failed; retrying"; sleep 5
+            curl -sL --fail --connect-timeout 30 --max-time 900 \
+              -H "Range: bytes=${OFFSET}-${END}" -o "$PART_FILE" "$HF_URL" && break
+            echo "fetch attempt $attempt failed (exit $?); retrying"; sleep 5
           done
           got=$(stat -c%s "$PART_FILE")
           if [ "$got" != "$SIZE" ]; then
