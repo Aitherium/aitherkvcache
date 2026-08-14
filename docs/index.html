@@ -19,8 +19,9 @@
 
    Source of truth for every public-facing STATIC page (GitHub Pages landing
    sites, generated docs). Tokens are extracted from the live aitherium.com
-   design system (AitherOS/apps/AitherVeil/src/app/globals.css — the dark-glass
-   OKLch theme) so static pages match the estate instead of inventing a look.
+   design system (the dark-glass OKLch theme) so static pages match the estate
+   instead of inventing a look. NOTE: this file is INLINED VERBATIM into public
+   pages, so it must name no internal path — publish_gate scans for them.
 
    Consumed by tools/gen_public_pages.py, which INLINES this file verbatim into
    each generated page and fails loudly if it is missing. Edit HERE, then

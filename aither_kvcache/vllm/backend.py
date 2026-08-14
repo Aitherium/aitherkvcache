@@ -615,7 +615,7 @@ def _make_backend_class():
     # = False (e.g. the Aitherium 0.19.1 fork), the KV write happens in
     # do_kv_cache_update() via the unified_kv_cache_update splitting op and
     # TritonAttentionImpl.forward() NEVER writes KV. Declaring True there
-    # would silently skip every KV write (D-395). On builds where the parent
+    # would silently skip every KV write. On builds where the parent
     # says True, forward() includes the write and our impl writes inline.
     try:
         from vllm.v1.attention.backends.triton_attn import (
@@ -634,7 +634,7 @@ def _make_backend_class():
         slow decode), so capabilities the parent honors are honored here —
         the fused TQ decode kernel routes around itself for layers that
         need window/softcap/sink semantics (see _tq_exact_attn_only).
-        FAILURE B (D-395): without these mirrors the nightly validator
+        FAILURE B: without these mirrors the nightly validator
         rejects CUSTOM for gemma4 ("sliding window not supported" +
         "partial multimodal token full attention not supported").
         """
@@ -1170,7 +1170,7 @@ def _make_impl_class():
         def _ensure_primary_cache_layout(self, kv_cache):
             """FAIL-CLOSED gate: refuse to serve if the cache is not TQ layout.
 
-            The D-395 gibberish came from exactly this state: PRIMARY armed
+            The gibberish came from exactly this state: PRIMARY armed
             via AITHER_TQ_MODE while the engine patches (page_size + uint8
             reshape) never ran, so uint8 packed nibbles were cast-written
             into a bf16 cache and dequant read float garbage. Registered !=
@@ -1190,7 +1190,7 @@ def _make_impl_class():
                     f"block_size, kv_heads, tq_dim={tq_dim}]. The TQ engine "
                     f"patches (page_size + uint8 reshape) did not run in "
                     f"this process, so serving would generate pure gibberish"
-                    f" (D-395). Refusing to serve. Fix: ensure the "
+                    f". Refusing to serve. Fix: ensure the "
                     f"aither-kvcache plugin applied apply_tq_patches() "
                     f"(AITHER_TQ_BITS set, vllm.general_plugins loaded, "
                     f"AITHER_TQ_RESHAPE not disabled), or unset "
@@ -1343,7 +1343,7 @@ def _make_impl_class():
             # A failed KV write means this step's tokens are MISSING from
             # the cache — forward() skips its inline write because the hook
             # is active, so swallowing here silently degrades generation
-            # (the D-395 genre; review finding). Log loudly and PROPAGATE:
+            # (the genre; review finding). Log loudly and PROPAGATE:
             # a dead engine beats quietly-wrong output.
             try:
                 self._tq_write_primary(

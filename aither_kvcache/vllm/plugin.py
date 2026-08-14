@@ -44,7 +44,7 @@ def register():
         print(f"[aither-kvcache] Backend registration failed: {e}",
               file=sys.stderr, flush=True)
 
-    # 1b. Apply TQ engine patches when armed (D-395 fix). Registering the
+    # 1b. Apply TQ engine patches when armed ( fix). Registering the
     # CUSTOM backend alone is NOT activation: PRIMARY mode also needs the
     # engine patches (page_size + uint8 reshape + spill-on-free) or the KV
     # cache stays a float tensor and the backend fail-closes at first
@@ -55,13 +55,13 @@ def register():
     tq_mode = os.environ.get("AITHER_TQ_MODE", "")
     tq_bits_str = os.environ.get("AITHER_TQ_BITS", "")
     if tq_mode.endswith("-primary"):
-        # D-411: PRIMARY is EAGER-ONLY today. Under torch.compile +
+        # PRIMARY is EAGER-ONLY today. Under torch.compile +
         # piecewise CUDA graphs (fork 0.19.1) the padded splitting-op
         # inputs make the layer-0 hook write trip a device-side index
         # assert during decode replay and the engine dies mid-generation.
         print("[aither-kvcache] WARNING: TQ PRIMARY mode is EAGER-ONLY — "
               "pass --enforce-eager (VLLM_TQ_ENFORCE_EAGER=1). Compiled/"
-              "cudagraph mode crashes with a device-side assert (D-411).",
+              "cudagraph mode crashes with a device-side assert.",
               file=sys.stderr, flush=True)
     if tq_mode or tq_bits_str in ("2", "3", "4"):
         try:

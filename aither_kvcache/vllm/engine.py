@@ -151,7 +151,7 @@ def _align_page_size(raw_bytes: int) -> int:
     OFF by default (AITHER_TQ_ALIGN_PAGES=0): for uniform models the padding
     is pure waste — e.g. Nemotron-8B TQ4 pages are 17408 B, aligned to 32768 B
     that nearly HALVES effective compression — and the padding broke the
-    reshape patch's exact-view invariant (D-395 follow-up: boot crash
+    reshape patch's exact-view invariant ( follow-up: boot crash
     "shape invalid for input of size"). Set AITHER_TQ_ALIGN_PAGES=1 for
     heterogeneous head-dim models; the reshape patch then uses a strided
     view that skips per-page padding.
