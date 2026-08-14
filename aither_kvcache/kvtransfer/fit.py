@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
 from .capture import CaptureManifest
 from .geometry import KVGeometry, check_pair
 from .mapper import GramStats, LayerMap, fit_layer_map

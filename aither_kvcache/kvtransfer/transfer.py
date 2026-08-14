@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
 from .capture import _extract_kv, _stack_layers, gather_corpus
 from .geometry import KVGeometry
 from .pack import (
