@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aither-kvcache"
-version = "2.3.0"
-description = "Near-optimal KV cache compression for LLM inference — TurboQuant (vector quantization) + TriAttention (spectral compression)"
+version = "2.4.0"
+description = "KV cache tooling for LLM inference — TurboQuant (vector quantization), TriAttention (spectral compression), and cross-model KV transfer (skip prefill by converting one model's cache into another's)"
 readme = "README.md"
 license = "CC-BY-4.0"
 requires-python = ">=3.10"
@@ -25,6 +25,7 @@ classifiers = [
 keywords = [
     "kv-cache", "quantization", "llm", "inference", "compression",
     "turboquant", "triattention", "spectral", "vllm", "attention",
+    "kv-transfer", "cross-model", "prefill", "rope", "mla",
 ]
 dependencies = [
     "torch>=2.0",
@@ -36,7 +37,12 @@ triton = ["triton>=2.0"]
 scipy = ["scipy"]
 dev = ["pytest"]
 vllm = ["vllm>=0.15"]
-all = ["triton>=2.0", "scipy", "pytest"]
+# Cross-model KV transfer: the mapper, pack format and rotation math need only
+# numpy (already a core dep). Capturing activations from real models and the
+# acceptance evaluation additionally need transformers; both are imported
+# lazily so the rest of the package works without them.
+transfer = ["transformers>=4.40"]
+all = ["triton>=2.0", "scipy", "pytest", "transformers>=4.40"]
 
 [project.entry-points."vllm.general_plugins"]
 aither_kvcache = "aither_kvcache.vllm.plugin:register"

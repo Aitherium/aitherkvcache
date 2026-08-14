@@ -9,12 +9,18 @@ Near-optimal KV cache compression for LLM inference. Two compression engines:
   Retains top RoPE frequency pairs, scores via trig series without materializing full K/V.
   ~10× compression with bounded approximation error. Calibrated for Qwen3.5 family.
 
+- **KVTransfer** *(NEW in v2.4)* — Cross-model KV transfer. Convert one model's KV cache
+  into another model's so the receiving model **skips prefill entirely**. Per-(layer, head)
+  linear maps fitted by ridge; source layers chosen per target layer by held-out R².
+  Same model family only — the two models must share a tokenizer.
+
 ## Installation
 
 ```bash
 pip install aither-kvcache            # core library
 pip install aither-kvcache[vllm]      # + vLLM plugin (v0.15+)
 pip install aither-kvcache[triton]    # + fused GPU kernels
+pip install aither-kvcache[transfer]  # + cross-model KV transfer
 pip install aither-kvcache[all]       # everything
 ```
 
@@ -88,6 +94,95 @@ instead of 256 — a ~10× reduction with bounded approximation error.
 | F=12, int8 | 8 | 38 | 6.74× |
 | F=16, int4 | 4 | 34 | 7.53× |
 | F=8, int4 | 4 | 18 | **14.2×** |
+
+## Quick Start — KVTransfer (v2.4+)
+
+Prefill is the tax you pay before a model says anything, and a KV cache only works on the
+model that produced it. Route a conversation to a different model and the accumulated
+cache becomes dead weight. KVTransfer fits a map that converts one model's cache into
+another's, so the receiving model can skip prefill.
+
+```bash
+# 1. capture aligned KV from both models over one corpus
+python -m aither_kvcache.kvtransfer.capture \
+    --source Qwen/Qwen3-0.6B --target Qwen/Qwen3-4B \
+    --out ./cap --corpus ./my-corpus --seq-len 256 --train-seqs 64 --val-seqs 24
+
+# 2. fit the mapper pack
+python -m aither_kvcache.kvtransfer.fit --capture ./cap --out ./pack --top-k 8
+
+# 3. measure what the RECEIVING model does with a translated cache, and record it
+python -m aither_kvcache.kvtransfer.transfer \
+    --pack ./pack --source Qwen/Qwen3-0.6B --target Qwen/Qwen3-4B \
+    --corpus ./held-out --sequences 24 --cuts 32 64 96 128 160 192 224 --record
+```
+
+```python
+from aither_kvcache.kvtransfer import load_pack
+from aither_kvcache.kvtransfer.transfer import translate_cache
+
+pack = load_pack("./pack", live_source=src_geom, live_target=tgt_geom)
+layers = translate_cache(src_k, src_v, pack, positions)   # -> the target's KV cache
+```
+
+### Step 3 is not optional
+
+`load_pack` **refuses** any pack that carries no downstream acceptance evidence. That is
+the core design decision here, and it is not defensive programming — it is the only thing
+standing between an interesting R² and a broken deployment.
+
+A converted cache does not fail loudly. An approximate one makes the receiving model
+produce fluent, on-topic, **confidently wrong** text: no exception, no error status, no
+unhealthy process, nothing in a log. Every cheap signal is green.
+
+So a pack must carry a measurement, and the measurement has **four arms**:
+
+| arm | what it is |
+|---|---|
+| `reference` | the target prefills the context itself — the ceiling |
+| `translated` | the target is handed the converted cache — the candidate |
+| `control` | the map is run on a **different document** — catches a mapper ignoring its input |
+| `nocontext` | no cache at all — the floor |
+
+The control arm is the one that matters. A mapper that has quietly learned the target's
+*average* key/value statistics scores respectably against `reference` alone. Without a
+floor, "68% agreement" is unreadable — it could be excellent, or exactly what a dead
+mapper gets.
+
+A minimum sample size is enforced too. Top-1 agreement is a proportion, so a mean over a
+few dozen positions has a standard error near ten percentage points — and once recorded it
+is indistinguishable from a mean over ten thousand.
+
+### Preconditions that are definitional, not quality knobs
+
+- **The two models must tokenize identically.** The map sends position *i* to position
+  *i*; different tokenizers mean row *i* is not the same token and the fit is regressing
+  misaligned data. Nothing downstream can see this — it reads as "this pair transfers
+  poorly" rather than "these rows do not correspond". Enforced by vocabulary digest, and
+  by comparing token ids per document at capture time.
+- **The RoPE schedule must be exactly reproducible.** Keys carry a position rotation, so
+  the map is fitted in position-free space: stripped with the *source* schedule, re-applied
+  with the *target's* (not a no-op — the two models often disagree on `rope_theta`).
+  `default`, `linear` and `yarn` are implemented; anything else is refused rather than
+  approximated.
+
+`check_pair()` separates definitional refusals from merely-unproven regimes — mismatched
+KV-head counts, differing head dimension, cross-family pairs. The latter are recorded as
+flags and decided by measurement, because a gate keyed on "heads must match" would refuse
+the very experiment that tests whether heads need to match.
+
+### Latent attention (MLA)
+
+Models such as DeepSeek V2/V3/V4 cache a compressed latent plus a decoupled RoPE key
+rather than per-head K and V. That is a different cache **layout**, not an obstacle — the
+latent is dense, and often smaller than a conventional cache for the same context.
+`KVGeometry.roles()` returns `("c", "kr")` for those models, and only `kr` carries a
+rotation because the latent is position-free by construction.
+
+The latent is captured at the compression projection rather than from `past_key_values`:
+HuggingFace materialises per-head K/V before caching, so reading the cache would yield
+tensors a real serving engine never stores, and a mapper fitted to them could not drive a
+production deployment while looking entirely correct end to end.
 
 ## vLLM Integration
 

@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>aither-kvcache — near-optimal KV cache compression</title>
-<meta name="description" content="Sub-byte KV cache compression for LLM inference. TurboQuant vector quantization and TriAttention spectral compression, without calibration data.">
-<meta property="og:title" content="aither-kvcache — near-optimal KV cache compression">
-<meta property="og:description" content="Sub-byte KV cache compression for LLM inference. TurboQuant vector quantization and TriAttention spectral compression, without calibration data.">
+<title>aither-kvcache — compress it, or move it between models</title>
+<meta name="description" content="KV cache tooling for LLM inference. TurboQuant vector quantization, TriAttention spectral compression, and cross-model KV transfer that lets one model reuse another&#x27;s cache.">
+<meta property="og:title" content="aither-kvcache — compress it, or move it between models">
+<meta property="og:description" content="KV cache tooling for LLM inference. TurboQuant vector quantization, TriAttention spectral compression, and cross-model KV transfer that lets one model reuse another&#x27;s cache.">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#0A0F1E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -494,8 +494,8 @@ header .wrap>*:nth-child(6){animation-delay:.25s}
   <div class="exp"><span class="glyph">◉</span>
     <span>You are in <b>The Crucible</b> — How small can it get?</span>
   </div>
-  <h1>KV cache, <span class="g">sub-byte</span></h1>
-  <p class="lede">Two compression engines for LLM inference memory. TurboQuant reaches 2–4 bit within 2.7× of the information-theoretic optimum, with no calibration data and no offline pass.</p>
+  <h1>KV cache, <span class="g">sub-byte</span> — and portable</h1>
+  <p class="lede">Three engines for LLM inference memory. Compress a cache to 2–4 bit with no calibration pass, or convert one model&#x27;s cache into another model&#x27;s so the receiving model skips prefill entirely.</p>
   <div class="cta">
     <a class="btn btn-p" href="#start">Get started</a>
     <a class="btn btn-s" href="https://github.com/Aitherium/aitherkvcache">View source</a>
@@ -507,15 +507,15 @@ tq = TurboQuant(head_dim=128, bits=4, device=&quot;cuda&quot;)
 packed, norms = tq.encode(kv_vectors)
 decoded = tq.decode(packed, norms)
 <span class="c">#   [..., 128] fp16  -&gt;  [..., 64] uint8 + [...] f32</span></pre></div>
-  <div class="stats"><div class="stat"><span class="v">2–4</span><span class="l">bits</span></div><div class="stat"><span class="v">3.8–7.1×</span><span class="l">compression</span></div><div class="stat"><span class="v">~10×</span><span class="l">triattention</span></div><div class="stat"><span class="v">2.3</span><span class="l">version</span></div></div>
+  <div class="stats"><div class="stat"><span class="v">2–4</span><span class="l">bits</span></div><div class="stat"><span class="v">3.8–7.1×</span><span class="l">compression</span></div><div class="stat"><span class="v">3</span><span class="l">engines</span></div><div class="stat"><span class="v">2.4</span><span class="l">version</span></div></div>
 </div></header>
 
 <section id="catalogue"><div class="wrap"><h2>What it costs you, in GB</h2><p class="sub">The KV cache is usually the reason you cannot raise the context or the batch size. Put your model in and see the number move — this is the real formula, not an illustration.</p><div class="panel" id="kvcalc"><div class="panel-hd"><span class="t">kv cache calculator</span><span class="sp"></span><span class="count js-pct"></span></div><div class="field-row"><div><label for="kv-layers">layers</label><input class="field" id="kv-layers" type="number" value="80" ></div><div><label for="kv-heads">kv heads</label><input class="field" id="kv-heads" type="number" value="8" ></div><div><label for="kv-dim">head dim</label><input class="field" id="kv-dim" type="number" value="128" ></div></div><div class="field-row"><div><label for="kv-ctx">context tokens</label><input class="field" id="kv-ctx" type="number" value="131072" ></div><div><label for="kv-batch">batch</label><input class="field" id="kv-batch" type="number" value="1" ></div><div><label for="kv-bits">quant bits</label><input class="field" id="kv-bits" type="number" value="4" min="2" max="16" step="1"></div></div><div class="kv"><div class="cell flat"><span class="l">fp16 cache</span><span class="v" data-out="fp16">--</span></div><div class="cell"><span class="l">compressed</span><span class="v" data-out="packed">--</span></div><div class="cell"><span class="l">freed</span><span class="v" data-out="saved">--</span></div><div class="cell"><span class="l">ratio</span><span class="v" data-out="ratio">--</span></div></div><div class="bar-cmp"><div class="track"><div class="fill js-fill"></div></div><div class="lbl"><span>compressed</span><span>fp16 baseline</span></div></div></div><p class="sub" style="margin-top:18px;font-size:.86rem">Defaults are a 70B-class model with grouped-query attention at 128K context. Bits below 4 are the aggressive end of the TurboQuant range; measure quality on your own workload before shipping one.</p></div></section>
 
 <section id="features"><div class="wrap">
-  <h2>Two engines</h2>
-  <p class="sub">Pick the trade-off that fits: general-purpose vector quantization, or spectral compression tuned to a model family.</p>
-  <div class="grid"><div class="card"><span class="ico">turboquant</span><h3>Vector quantization</h3><p>2–4 bit quantization reaching 3.8–7.1× compression against FP16, provably near the information-theoretic bound.</p></div><div class="card"><span class="ico">streaming</span><h3>No calibration pass</h3><p>Works on streaming tokens with no calibration dataset and no offline profiling step before you can use it.</p></div><div class="card"><span class="ico">triattention</span><h3>Spectral compression</h3><p>Retains the top RoPE frequency pairs and scores through a trigonometric series without materializing full K/V — around 10× with bounded error.</p></div><div class="card"><span class="ico">vllm</span><h3>vLLM plugin</h3><p>Install the vllm extra to slot into vLLM v0.15+ rather than rewriting your serving stack.</p></div><div class="card"><span class="ico">triton</span><h3>Fused kernels</h3><p>An optional Triton extra provides fused GPU kernels for the hot encode/decode path.</p></div><div class="card"><span class="ico">research</span><h3>Published basis</h3><p>TurboQuant implements Zandieh et al., arXiv:2504.19874 — the method is documented and citable, not a black box.</p></div></div>
+  <h2>Three engines</h2>
+  <p class="sub">Pick the trade-off that fits: general-purpose vector quantization, spectral compression tuned to a model family, or moving a cache between models entirely.</p>
+  <div class="grid"><div class="card"><span class="ico">turboquant</span><h3>Vector quantization</h3><p>2–4 bit quantization reaching 3.8–7.1× compression against FP16, provably near the information-theoretic bound.</p></div><div class="card"><span class="ico">streaming</span><h3>No calibration pass</h3><p>Works on streaming tokens with no calibration dataset and no offline profiling step before you can use it.</p></div><div class="card"><span class="ico">triattention</span><h3>Spectral compression</h3><p>Retains the top RoPE frequency pairs and scores through a trigonometric series without materializing full K/V — around 10× with bounded error.</p></div><div class="card"><span class="ico">kvtransfer</span><h3>Cross-model transfer</h3><p>Fit per-(layer, head) linear maps that convert one model&#x27;s KV cache into another&#x27;s, so the receiving model can skip prefill. RoPE is stripped with the source schedule and re-applied with the target&#x27;s; source layers are chosen per target layer by held-out R².</p></div><div class="card"><span class="ico">gate</span><h3>Refuses bad mappers</h3><p>A converted cache does not fail loudly — an approximate one makes the model produce fluent, confidently wrong text. So a mapper pack will not load without held-out reconstruction scores AND a downstream measurement, over a large enough sample, against a control arm that catches a mapper ignoring its input.</p></div><div class="card"><span class="ico">latent</span><h3>MLA aware</h3><p>Handles latent-attention models (DeepSeek V2/V3/V4), whose cache is a compressed latent plus a decoupled RoPE key rather than per-head K/V — captured at the compression projection, where it is position-free.</p></div><div class="card"><span class="ico">vllm</span><h3>vLLM plugin</h3><p>Install the vllm extra to slot into vLLM v0.15+ rather than rewriting your serving stack.</p></div><div class="card"><span class="ico">triton</span><h3>Fused kernels</h3><p>An optional Triton extra provides fused GPU kernels for the hot encode/decode path.</p></div><div class="card"><span class="ico">research</span><h3>Published basis</h3><p>TurboQuant implements Zandieh et al., arXiv:2504.19874 — the method is documented and citable, not a black box.</p></div></div>
 </div></section>
 
 <section id="start"><div class="wrap">
@@ -525,22 +525,12 @@ decoded = tq.decode(packed, norms)
 <span class="k">pip install &quot;aither-kvcache[vllm]&quot;</span>
 <span class="k">pip install &quot;aither-kvcache[triton]&quot;</span>
 <span class="k">pip install &quot;aither-kvcache[all]&quot;</span></pre></div>
-  <div class="note"><strong>Citation.</strong> TurboQuant implements <a href='https://arxiv.org/abs/2504.19874'>Zandieh et al., arXiv:2504.19874</a>. TriAttention is calibrated for the Qwen3.5 family; other RoPE bases need their own calibration.</div>
+  <div class="note"><strong>Citation.</strong> TurboQuant implements <a href='https://arxiv.org/abs/2504.19874'>Zandieh et al., arXiv:2504.19874</a>. TriAttention is calibrated for the Qwen3.5 family; other RoPE bases need their own calibration. <strong>Cross-model transfer works within a model family</strong> — the two models must share a tokenizer, because the map converts position <em>i</em> to position <em>i</em>, and a mapper is only usable once it carries a downstream measurement that clears its own floor.</div>
 </div></section>
 
 
 
 <section class="uni" id="universe"><div class="wrap"><h2>One estate, six doors</h2><p class="sub">These projects are organs of the same system — the same identity plane, the same agent runtime, the same operational discipline. Follow any of them.</p><div class="uni-stage"><canvas class="uni-canvas" aria-hidden="true"></canvas><div class="uni-nodes"><a class="orb" href="https://aitherium.com" data-id="aitherium" data-kind="the os" style="--orb:var(--cyan)"><span class="k">the os</span><span class="n">aitherium.com</span><span class="d">The Living OS these four repos are cut from. Open, no login.</span></a><a class="orb" href="https://aitherium.github.io/aither-adk/" data-id="aither-adk" data-kind="python" style="--orb:var(--accent-warm)"><span class="k">python</span><span class="n">Aither ADK</span><span class="d">Build agent fleets. Any backend, effort-routed, real memory.</span></a><a class="orb" href="https://aitherium.github.io/aither-skills/" data-id="aither-skills" data-kind="markdown" style="--orb:var(--cyan)"><span class="k">markdown</span><span class="n">aither-skills</span><span class="d">Operational procedures an agent can load and run. MIT.</span></a><a class="orb here" href="https://aitherium.github.io/aitherkvcache/" data-id="aitherkvcache" data-kind="cuda" style="--orb:var(--lavender)"><span class="k">cuda</span><span class="n">aither-kvcache</span><span class="d">Sub-byte KV cache compression for LLM inference.</span></a><a class="orb" href="https://aitherium.github.io/AitherZero/" data-id="AitherZero" data-kind="powershell" style="--orb:var(--mint)"><span class="k">powershell</span><span class="n">AitherZero</span><span class="d">Numbered, discoverable automation and declarative playbooks.</span></a><a class="orb" href="https://blog.aitherium.com" data-id="blog" data-kind="writing" style="--orb:var(--coral)"><span class="k">writing</span><span class="n">The Blog</span><span class="d">How all of it is actually built, measured and operated.</span></a></div></div></div></section>
-
-
-<section class="aither-ecosystem">
-<h2>The ecosystem this belongs to</h2>
-<p>Every Aitherium repository publishes an <code>aither-manifest.json</code> beside its
-page, and each surface reads all of them — so the network is browsable from any node in
-it. A repository that publishes nothing shows as <em>unknown</em>, never as zero.</p>
-<div id="aither-constellation" data-self="aitherkvcache"></div>
-<script src="aither-constellation.js"></script>
-</section>
 
 <footer><div class="wrap"><div class="row">
   <span class="el"><span class="n">47</span><span class="s">Ai</span></span>
