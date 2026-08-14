@@ -5,9 +5,14 @@ Near-optimal KV cache compression for LLM inference. Two compression engines:
 - **TurboQuant** — Vector quantization ([Zandieh et al., arXiv:2504.19874](https://arxiv.org/abs/2504.19874)).
   2-4 bit, 3.8-7.1× compression vs FP16. No calibration data. Works on streaming tokens.
 
-- **TriAttention** *(NEW in v2.0)* — Spectral KV compression via trigonometric series.
+- **TriAttention** *(v2.0)* — Spectral KV compression via trigonometric series.
   Retains top RoPE frequency pairs, scores via trig series without materializing full K/V.
-  ~10× compression with bounded approximation error. Calibrated for Qwen3.5 family.
+  14–26× compression at F=8–16. **Calibration-dependent — read this before using it:**
+  which frequency pairs carry the energy is a property of the model, and off-profile the
+  ranking degrades while reconstruction still looks fine. Measured on an *uncalibrated*
+  model at the F=12 default: cosine 0.91, but mean top-32 attention overlap **0.41** over
+  64 query directions. Profiles ship for Qwen3.5, Nemotron, DeepSeek-R1 and Llama 3.1;
+  anything else now emits a `RuntimeWarning` instead of falling back silently.
 
 - **KVTransfer** *(NEW in v2.4)* — Cross-model KV transfer. Convert one model's KV cache
   into another model's so the receiving model **skips prefill entirely**. Per-(layer, head)

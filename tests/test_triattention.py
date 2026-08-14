@@ -437,6 +437,39 @@ class TestCalibration:
         cfg = get_config_for_model("totally-unknown-model-42B")
         assert cfg.model_family == "generic"
 
+    def test_unknown_model_fallback_warns(self):
+        """Off-profile must be LOUD, not silent.
+
+        Which RoPE frequency pairs carry the energy is a property of the model,
+        so generic selection on an uncalibrated model degrades what attention
+        RANKS on while reconstruction still looks healthy. Measured off-profile
+        at num_freqs=12: cosine 0.91 but mean top-32 attention overlap 0.41 over
+        64 query directions — fewer than half the tokens the model would have
+        attended to, with nothing to notice.
+        """
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            get_config_for_model("totally-unknown-model-42B")
+        assert len(caught) == 1, "silent fallback to generic frequency selection"
+        assert issubclass(caught[0].category, RuntimeWarning)
+        assert "no calibrated profile" in str(caught[0].message)
+
+    def test_known_model_does_not_warn(self):
+        """The mutation guard: a warn-on-everything fallback is also wrong.
+
+        Without this, a get_config_for_model that warns unconditionally passes
+        the test above while training users to ignore the warning.
+        """
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            cfg = get_config_for_model("Qwen3.5-32B")
+        assert cfg.model_family != "generic", "a calibrated model resolved to generic"
+        assert not caught, f"warned on a calibrated model: {[str(c.message) for c in caught]}"
+
     def test_all_profiles_generate_valid_config(self):
         for name, profile in ALL_PROFILES.items():
             cfg = profile.to_config()
