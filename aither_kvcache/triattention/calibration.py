@@ -214,8 +214,6 @@ NEMOTRON_PROFILES: Dict[str, ModelProfile] = {
             "nvidia/Nemotron-Orchestrator-8B",
             "cyankiwi/Nemotron-Orchestrator-8B-AWQ-4bit",
             "Nemotron-Orchestrator-8B-AWQ",
-            "aither-orchestrator",
-            "aither-orchestrator-8b",
         ],
     ),
 }

@@ -394,7 +394,6 @@ class TestCalibration:
             "Nemotron-Orchestrator-8B",
             "nvidia/Nemotron-Orchestrator-8B",
             "cyankiwi/Nemotron-Orchestrator-8B-AWQ-4bit",
-            "aither-orchestrator",
         ]:
             p = get_profile(alias)
             assert p is not None, f"Alias '{alias}' should resolve"
