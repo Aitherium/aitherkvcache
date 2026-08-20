@@ -1,22 +1,14 @@
 {
   "schemaVersion": "1",
   "name": "aitherkvcache",
-  "description": "KV-cache and model-weight mirror: self-hosted weights for in-browser and edge inference.",
+  "description": "Near-optimal KV cache quantization for LLM inference — sub-byte compression.",
   "url": "https://aitherium.github.io/aitherkvcache/",
   "repository": "https://github.com/Aitherium/aitherkvcache",
-  "kind": "service",
-  "language": "Python",
-  "license": "Apache-2.0",
-  "metrics": {
-    "modules": {
-      "value": 27,
-      "as_of": "2026-08-10T08:33:23Z"
-    },
-    "quantisation kernels": {
-      "value": 9,
-      "as_of": "2026-08-10T08:33:23Z"
-    }
-  },
-  "generated_at": "2026-08-10T08:33:23Z",
-  "version": "fleet-deepseek-v4flash-iq2m"
+  "kind": "tool",
+  "status": "public",
+  "adopt": "Quantize the cache on one model you already serve and measure the headroom.",
+  "pairs_with": [
+    "awnode"
+  ],
+  "includes": []
 }
