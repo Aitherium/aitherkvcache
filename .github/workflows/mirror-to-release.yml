@@ -188,9 +188,12 @@ jobs:
           json.dump(items, sys.stdout)
           EOF
 
-          # Collect this run's hashes from the matrix artifacts.
+          # Collect this run's hashes from the matrix artifacts. The download
+          # step landed them in /tmp/shas with UNIQUE inner names (sha-*.txt —
+          # merge-multiple collapses a shared name; measured 2026-08-27), so
+          # the loop reads /tmp/shas, not the workspace.
           mkdir -p /tmp/shas
-          for f in sha-*; do
+          for f in /tmp/shas/sha-*.txt; do
             [ -e "$f" ] || continue
             cat "$f" >> /tmp/shas/hashes.txt
           done
@@ -220,6 +223,7 @@ jobs:
           # the asset name.
           python3 - <<EOF > /tmp/${NAME}.manifest.json
           import json
+          import sys
           total, part = int("$TOTAL"), int("$PART")
           parts = json.load(open("/tmp/parts.json"))
           hashes = dict(l.split("  ", 1)[::-1] for l in open("/tmp/shas/hashes.txt")
