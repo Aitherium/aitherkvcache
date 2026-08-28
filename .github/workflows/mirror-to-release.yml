@@ -134,13 +134,15 @@ jobs:
 
           # The release-manifest contract (D-2261): every release carries its
           # own <name>.manifest.json. The manifest job needs this part's hash —
-          # ship it as a tiny artifact rather than re-downloading the part.
-          printf '%s  %s\n' "$(sha256sum "$PART_FILE" | cut -d' ' -f1)" "$PART_FILE" > sha.txt
+          # ship it as a tiny artifact rather than re-downloading the part. The
+          # inner filename is UNIQUE per row: merge-multiple with a shared
+          # sha.txt name collapses them all to one (measured 2026-08-27).
+          printf '%s  %s\n' "$(sha256sum "$PART_FILE" | cut -d' ' -f1)" "$PART_FILE" > "sha-${{ matrix.idx }}.txt"
       - name: Ship part hash for the manifest job
         uses: actions/upload-artifact@v4
         with:
           name: sha-${{ matrix.idx }}
-          path: sha.txt
+          path: sha-${{ matrix.idx }}.txt
           if-no-files-found: error
 
   manifest:
@@ -204,7 +206,19 @@ jobs:
             fi
           done < <(python3 -c 'import json; print("\n".join(p["name"] for p in json.load(open("/tmp/parts.json"))))')
 
-          python3 - <<EOF > /tmp/manifest.json
+          # The whole-file sha256 is part of the CLI's manifest contract
+          # (manifest.validate refuses a null whole digest — measured
+          # 2026-08-27). The parts are hashed already; the whole stream is
+          # hashed from the SOURCE (cloud-to-cloud, the same URL the matrix
+          # Range-fetches) — one extra pass, never stored. SHELL line: it must
+          # sit OUTSIDE the python heredoc, or the shell expands it as a side
+          # effect and python never sees a value (measured 2026-08-27: WHOLE:
+          # unbound variable).
+          WHOLE=$(curl -sL --fail --connect-timeout 30 --max-time 3600 "$SRC" | sha256sum | cut -d' ' -f1)
+          # The asset must be named <name>.manifest.json — gh 2.83 removed the
+          # `file#name` rename (measured 2026-08-27), so the LOCAL file carries
+          # the asset name.
+          python3 - <<EOF > /tmp/${NAME}.manifest.json
           import json
           total, part = int("$TOTAL"), int("$PART")
           parts = json.load(open("/tmp/parts.json"))
@@ -217,18 +231,9 @@ jobs:
                         f"manifest that cannot verify its parts", file=sys.stderr)
                   raise SystemExit(1)
               p["sha256"] = h
-          # The whole-file sha256 is part of the CLI's manifest contract
-          # (manifest.validate refuses a null whole digest — measured
-          # 2026-08-27). The parts are hashed already; the whole stream is
-          # hashed from the SOURCE (cloud-to-cloud, the same URL the matrix
-          # Range-fetches) — one extra pass, never stored.
-          WHOLE=$(curl -sL --fail --connect-timeout 30 --max-time 3600 "$SRC" | sha256sum | cut -d' ' -f1)
           manifest = {"name": "$NAME", "total": total, "part_size": part,
                       "sha256": "$WHOLE", "parts": parts}
-          # The asset must be named <name>.manifest.json — gh 2.83 removed the
-          # `file#name` rename (measured 2026-08-27), so the LOCAL file carries
-          # the asset name.
-          json.dump(manifest, open("/tmp/${NAME}.manifest.json", "w"), indent=2)
+          json.dump(manifest, sys.stdout, indent=2)
           EOF
 
           gh release upload "$RELEASE" /tmp/${NAME}.manifest.json --repo "$GITHUB_REPOSITORY" \
