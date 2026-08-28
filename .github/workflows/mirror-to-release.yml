@@ -204,7 +204,10 @@ jobs:
           done < <(find tmp/shas -name 'sha-*.txt' 2>/dev/null)
           # Any part whose hash this run did not produce (a resume skipped it)
           # is downloaded from the release and hashed here — bounded by the
-          # skipped set, not the whole artifact.
+          # skipped set, not the whole artifact. The sha256sum line format is
+          # "hash  name\n" — the trailing newline must be stripped BEFORE the
+          # key split, or it rides the dict key and every lookup misses
+          # (measured 2026-08-27: {name\n: hash} -> MISSING HASH refused).
           while read -r pname; do
             if ! grep -qF "  $pname" tmp/shas/hashes.txt; then
               gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" \
@@ -231,8 +234,8 @@ jobs:
           import sys
           total, part = int("$TOTAL"), int("$PART")
           parts = json.load(open("/tmp/parts.json"))
-          hashes = dict(l.split("  ", 1)[::-1] for l in open("tmp/shas/hashes.txt")
-                        if "  " in l)
+          hashes = dict(l.rstrip("\n").split("  ", 1)[::-1]
+                        for l in open("tmp/shas/hashes.txt") if "  " in l)
           for p in parts:
               h = hashes.get(p["name"])
               if not h:
