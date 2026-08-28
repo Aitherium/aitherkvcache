@@ -1,0 +1,230 @@
+# mirror-to-release — cloud-to-cloud artifact mirror (awrtifact lane).
+#
+# SOURCE OF TRUTH lives HERE (monorepo). The deployed copy is pushed into the
+# store's repo (Aitherium/aitherkvcache:.github/workflows/...) via
+# `gh api -X PUT repos/Aitherium/aitherkvcache/contents/.github/workflows/...`
+# — that repo is a regenerable mirror surface, so edit here and re-push.
+#
+# This is the generalization of mirror-hf-to-release.yml: the SOURCE may be
+# ANY Range-serving URL (HuggingFace resolve, S3 presigned, another GitHub
+# release), not just HF. The input names are unchanged from the HF lane so a
+# dispatch written for one works for the other (awrtifact backup-catalog
+# emits exactly these inputs).
+#
+# Fan-out: one runner per 1.9GB part. Each runner Range-fetches its byte-exact
+# slice straight from the source and uploads it as a release asset — the
+# origin box's uplink is never involved. 20 runners in parallel turn a 40GB
+# shard from ~2.5h (home uplink) into ~10 minutes.
+#
+# Resumable: the plan job skips parts already present in the release, so
+# re-dispatching after any failure uploads only what is missing.
+# Part naming matches the awrtifact worker's generated CHUNKED manifest:
+# <name>.partN
+name: Mirror artifact to release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "Range-serving URL of the source file (HF resolve, S3, release asset)"
+        required: true
+      name:
+        description: "Served asset base name (worker CHUNKED naming)"
+        required: true
+      total_bytes:
+        description: "Exact source size in bytes (verified against the source)"
+        required: true
+      release:
+        description: "Release tag to upload into"
+        required: true
+      part_size:
+        description: "Part size in bytes"
+        required: false
+        default: "1900000000"
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: [self-hosted, Linux, X64, aws]
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      missing: ${{ steps.plan.outputs.missing }}
+    steps:
+      - name: Verify source size and compute missing parts
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SRC='${{ inputs.source_url }}'
+          TOTAL='${{ inputs.total_bytes }}'
+          PART='${{ inputs.part_size }}'
+          NAME='${{ inputs.name }}'
+          RELEASE='${{ inputs.release }}'
+
+          # FAIL LOUD if the source size does not match the declared total — a
+          # drifted source would slice garbage that stitches into corrupt
+          # artifacts.
+          src_len=$(curl -sIL "$SRC" | grep -i '^content-length' | tail -1 | tr -dc '0-9')
+          if [ "$src_len" != "$TOTAL" ]; then
+            echo "SIZE MISMATCH: source=$src_len declared=$TOTAL"; exit 1
+          fi
+
+          existing=$(gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' || true)
+
+          python3 - <<EOF >> "$GITHUB_OUTPUT"
+          import json, os
+          total, part = int("$TOTAL"), int("$PART")
+          name = "$NAME"
+          existing = set("""$existing""".split())
+          items = []
+          idx = pos = 0
+          while pos < total:
+              size = min(part, total - pos)
+              pname = f"{name}.part{idx}"
+              if pname not in existing:
+                  items.append({"idx": idx, "offset": pos, "size": size})
+              pos += size; idx += 1
+          print("matrix=" + json.dumps({"include": items}))
+          print("missing=" + str(len(items)))
+          EOF
+          echo "planned"
+
+  mirror:
+    needs: plan
+    if: needs.plan.outputs.missing != '0'
+    runs-on: [self-hosted, Linux, X64, aws]
+    strategy:
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+      max-parallel: 20
+      fail-fast: false
+    steps:
+      - name: Range-fetch part ${{ matrix.idx }} and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SRC='${{ inputs.source_url }}'
+          NAME='${{ inputs.name }}'
+          RELEASE='${{ inputs.release }}'
+          OFFSET='${{ matrix.offset }}'
+          SIZE='${{ matrix.size }}'
+          IDX='${{ matrix.idx }}'
+          END=$((OFFSET + SIZE - 1))
+          PART_FILE="${NAME}.part${IDX}"
+
+          # --max-time bounds a STALLED transfer (a hung connection exits 28 and
+          # retries) — without it one stalled fetch hung a runner for 3h+ while
+          # every cheap signal said in_progress (measured 2026-08-09, part7).
+          for attempt in 1 2 3; do
+            curl -sL --fail --connect-timeout 30 --max-time 900 \
+              -H "Range: bytes=${OFFSET}-${END}" -o "$PART_FILE" "$SRC" && break
+            echo "fetch attempt $attempt failed (exit $?); retrying"; sleep 5
+          done
+          got=$(stat -c%s "$PART_FILE")
+          if [ "$got" != "$SIZE" ]; then
+            echo "PART SIZE MISMATCH: got=$got want=$SIZE"; exit 1
+          fi
+          sha256sum "$PART_FILE"
+          gh release upload "$RELEASE" "$PART_FILE" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "uploaded $PART_FILE ($SIZE bytes)"
+
+          # The release-manifest contract (D-2261): every release carries its
+          # own <name>.manifest.json. The manifest job needs this part's hash —
+          # ship it as a tiny artifact rather than re-downloading the part.
+          printf '%s  %s\n' "$(sha256sum "$PART_FILE" | cut -d' ' -f1)" "$PART_FILE" > sha.txt
+      - name: Ship part hash for the manifest job
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha-${{ matrix.idx }}
+          path: sha.txt
+          if-no-files-found: error
+
+  manifest:
+    needs: mirror
+    runs-on: [self-hosted, Linux, X64, aws]
+    steps:
+      - name: Download the matrix part hashes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sha-*
+          path: /tmp/shas
+          merge-multiple: true
+
+      - name: Build and upload the release manifest asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SRC='${{ inputs.source_url }}'
+          NAME='${{ inputs.name }}'
+          RELEASE='${{ inputs.release }}'
+          TOTAL='${{ inputs.total_bytes }}'
+          PART='${{ inputs.part_size }}'
+
+          # Idempotent: the asset already there means a previous run built it.
+          if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | grep -qF "${NAME}.manifest.json"; then
+            echo "manifest asset already present — skipping"
+            exit 0
+          fi
+
+          # Uniform part math (same as the CLI's split): all-but-last = PART,
+          # last = the remainder.
+          python3 - "$TOTAL" "$PART" "$NAME" > /tmp/parts.json <<'EOF'
+          import json, sys
+          total, part, name = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+          items = []
+          pos = 0
+          while pos < total:
+              items.append({"name": f"{name}.part{len(items)}",
+                            "size": min(part, total - pos)})
+              pos += min(part, total - pos)
+          json.dump(items, sys.stdout)
+          EOF
+
+          # Collect this run's hashes from the matrix artifacts.
+          mkdir -p /tmp/shas
+          for f in sha-*; do
+            [ -e "$f" ] || continue
+            cat "$f" >> /tmp/shas/hashes.txt
+          done
+          # Any part whose hash this run did not produce (a resume skipped it)
+          # is downloaded from the release and hashed here — bounded by the
+          # skipped set, not the whole artifact.
+          while read -r pname; do
+            if ! grep -qF "  $pname" /tmp/shas/hashes.txt; then
+              gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$pname" --dir /tmp/resume 2>/dev/null || true
+              [ -f "/tmp/resume/$pname" ] && \
+                printf '%s  %s\n' "$(sha256sum "/tmp/resume/$pname" | cut -d' ' -f1)" "$pname" >> /tmp/shas/hashes.txt
+            fi
+          done < <(python3 -c 'import json; print("\n".join(p["name"] for p in json.load(open("/tmp/parts.json"))))')
+
+          python3 - <<EOF > /tmp/manifest.json
+          import json
+          total, part = int("$TOTAL"), int("$PART")
+          parts = json.load(open("/tmp/parts.json"))
+          hashes = dict(l.split("  ", 1)[::-1] for l in open("/tmp/shas/hashes.txt")
+                        if "  " in l)
+          for p in parts:
+              h = hashes.get(p["name"])
+              if not h:
+                  print(f"MISSING HASH for {p['name']} — refusing to upload a "
+                        f"manifest that cannot verify its parts", file=sys.stderr)
+                  raise SystemExit(1)
+              p["sha256"] = h
+          manifest = {"name": "$NAME", "total": total, "part_size": part,
+                      "sha256": None, "parts": parts}
+          # The asset must be named <name>.manifest.json — gh 2.83 removed the
+          # `file#name` rename (measured 2026-08-27), so the LOCAL file carries
+          # the asset name.
+          json.dump(manifest, open("/tmp/${NAME}.manifest.json", "w"), indent=2)
+          EOF
+
+          gh release upload "$RELEASE" /tmp/${NAME}.manifest.json --repo "$GITHUB_REPOSITORY" \
+            --clobber
+          echo "uploaded ${NAME}.manifest.json"
