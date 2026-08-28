@@ -189,14 +189,15 @@ jobs:
           EOF
 
           # Collect this run's hashes from the matrix artifacts. The download
-          # step landed them in /tmp/shas with UNIQUE inner names (sha-*.txt —
-          # merge-multiple collapses a shared name; measured 2026-08-27), so
-          # the loop reads /tmp/shas, not the workspace.
+          # step landed them under /tmp/shas with UNIQUE inner names
+          # (sha-*.txt — merge-multiple collapses a shared name; measured
+          # 2026-08-27) but the exact layout under the path is a detail of
+          # the action's version — find, not a glob, so either layout works.
           mkdir -p /tmp/shas
-          for f in /tmp/shas/sha-*.txt; do
-            [ -e "$f" ] || continue
+          : > /tmp/shas/hashes.txt
+          while IFS= read -r f; do
             cat "$f" >> /tmp/shas/hashes.txt
-          done
+          done < <(find /tmp/shas -name 'sha-*.txt' 2>/dev/null)
           # Any part whose hash this run did not produce (a resume skipped it)
           # is downloaded from the release and hashed here — bounded by the
           # skipped set, not the whole artifact.
