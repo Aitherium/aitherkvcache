@@ -217,8 +217,14 @@ jobs:
                         f"manifest that cannot verify its parts", file=sys.stderr)
                   raise SystemExit(1)
               p["sha256"] = h
+          # The whole-file sha256 is part of the CLI's manifest contract
+          # (manifest.validate refuses a null whole digest — measured
+          # 2026-08-27). The parts are hashed already; the whole stream is
+          # hashed from the SOURCE (cloud-to-cloud, the same URL the matrix
+          # Range-fetches) — one extra pass, never stored.
+          WHOLE=$(curl -sL --fail --connect-timeout 30 --max-time 3600 "$SRC" | sha256sum | cut -d' ' -f1)
           manifest = {"name": "$NAME", "total": total, "part_size": part,
-                      "sha256": None, "parts": parts}
+                      "sha256": "$WHOLE", "parts": parts}
           # The asset must be named <name>.manifest.json — gh 2.83 removed the
           # `file#name` rename (measured 2026-08-27), so the LOCAL file carries
           # the asset name.
