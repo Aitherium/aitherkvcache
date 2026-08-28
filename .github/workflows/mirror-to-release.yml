@@ -147,6 +147,14 @@ jobs:
 
   manifest:
     needs: mirror
+    # NEVER inherit a skip from the mirror job: when every part is already in
+    # the release (missing=0) the matrix is empty and mirror is SKIPPED — but
+    # that is exactly the mid-flight re-run whose manifest may be missing
+    # (measured 2026-08-27: a skipped mirror silently skipped the manifest
+    # job too, and the manifest never re-landed). The internal idempotent
+    # guard (asset already present -> exit 0) is what decides; the job must
+    # run whenever plan succeeded, mirror result or not.
+    if: needs.plan.result == 'success' && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - name: Download the matrix part hashes
