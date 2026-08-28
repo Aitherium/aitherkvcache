@@ -47,7 +47,7 @@ permissions:
 
 jobs:
   plan:
-    runs-on: [self-hosted, Linux, X64, aws]
+    runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       missing: ${{ steps.plan.outputs.missing }}
@@ -96,7 +96,7 @@ jobs:
   mirror:
     needs: plan
     if: needs.plan.outputs.missing != '0'
-    runs-on: [self-hosted, Linux, X64, aws]
+    runs-on: ubuntu-latest
     strategy:
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
       max-parallel: 20
@@ -145,7 +145,7 @@ jobs:
 
   manifest:
     needs: mirror
-    runs-on: [self-hosted, Linux, X64, aws]
+    runs-on: ubuntu-latest
     steps:
       - name: Download the matrix part hashes
         uses: actions/download-artifact@v4
