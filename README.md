@@ -609,6 +609,14 @@ walkthrough covering installation, validation, vLLM integration, and graph-aware
 }
 ```
 
+## Benchmarks
+
+Measured results live in [BENCHMARKS.md](BENCHMARKS.md): kernel numbers, and the
+distilled `aither-code-embed-0.6b` scored against general-purpose embedders on real
+documents (p@1 0.893 vs 0.821 for Qwen3-Embedding-0.6B and nomic-embed-text-v1.5, on 26
+real document chunks and 28 queries). Rerun the embedder comparison on your own corpus
+with `awembed compare`.
+
 ## Community
 
 - [GitHub Discussions](https://github.com/Aitherium/aitherkvcache/discussions) — Questions, ideas, show & tell
