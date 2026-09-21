@@ -78,6 +78,7 @@
     { id: "awpredict", label: "awpredict", blurb: "Predict what your environment does next, and..." },
     { id: "awevolve", label: "awevolve", blurb: "Point an agent at a file and a command that..." },
     { id: "awsh", label: "awsh", blurb: "Your terminal answers you -- type a question..." },
+    { id: "awmine", label: "awmine", blurb: "Mine what your agents did -- outcomes,..." },
     { id: "awrise", label: "awrise", blurb: "Wake an agent on a schedule, let it do one..." },
     { id: "awkno", label: "awkno", blurb: "The man page for the Aither World — every..." },
     { id: "awwall", label: "awwall", blurb: "Say what a workload may reach, and watch..." },
