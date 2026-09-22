@@ -132,7 +132,7 @@ jobs:
           gh release upload "$RELEASE" "$PART_FILE" --repo "$GITHUB_REPOSITORY" --clobber
           echo "uploaded $PART_FILE ($SIZE bytes)"
 
-          # The release-manifest contract (D-2261): every release carries its
+          # The release-manifest contract: every release carries its
           # own <name>.manifest.json. The manifest job needs this part's hash —
           # ship it as a tiny artifact rather than re-downloading the part. The
           # inner filename is UNIQUE per row: merge-multiple with a shared
