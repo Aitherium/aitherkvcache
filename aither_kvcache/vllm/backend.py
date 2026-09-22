@@ -954,10 +954,23 @@ def _make_impl_class():
                           file=sys.stderr, flush=True)
 
             # -- Decode path: fused TQ kernel (single-token generation) --
+            # 🚨 `tq_cache` is TurboQuantImpl._tq_gpu_cache — the SHADOW-mode
+            # cache, which is None in PRIMARY. Requiring it here made the fused
+            # decode kernel UNREACHABLE in the only mode that actually
+            # compresses: every PRIMARY decode fell through to
+            # TritonAttentionImpl. Measured 2026-08-18 on an A100 with the real
+            # orchestrator model: 41.8 tok/s TQ vs 166.5 fp8 (3.98x), and
+            # AITHER_TQ_FUSED=1 changed nothing (41.4) because this gate ate it.
+            #
+            # _ensure_fused_attn() immediately below already resolves the
+            # quantizer from EITHER _tq_gpu_cache (shadow) or _tq_quantizer
+            # (primary) — this condition simply had not been updated to match,
+            # so the helper could serve a mode the gate refused to reach.
             is_decode = (
                 self._fused_enabled
                 and not self._tq_exact_attn_only
-                and tq_cache is not None
+                and (tq_cache is not None
+                     or TurboQuantImpl._tq_quantizer is not None)
                 and hasattr(attn_metadata, "max_query_len")
                 and attn_metadata.max_query_len == 1
             )

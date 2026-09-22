@@ -35,7 +35,16 @@ if os.path.exists("AitherOS"):
     sys.path.insert(0, "AitherOS")
 
 import torch  # noqa: E402
-from lib.gpu.turboquant import TurboQuant, TurboQuantConfig  # noqa: E402,F401
+
+# Relative, not `from lib.gpu.turboquant import ...`: this module ships to the
+# public AitherKVCache package as top-level `turboquant/bench.py` (see
+# .github/workflows/sync-kvcache.yml), where `lib.gpu.turboquant` does not
+# exist. `TurboQuant`/`TurboQuantConfig` live in this same package's
+# __init__.py, so a relative import resolves identically whether the package
+# is `lib.gpu.turboquant` (monorepo) or `turboquant` (published) — matching
+# both invocations this file's own docstring documents
+# (`python -m lib.gpu.turboquant.bench` and `python -m turboquant.bench`).
+from . import TurboQuant, TurboQuantConfig  # noqa: E402,F401
 
 # Collected as (name, value) so main() can emit one stable METRIC block.
 _METRICS: list[tuple[str, float]] = []

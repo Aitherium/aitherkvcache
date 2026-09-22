@@ -6,7 +6,7 @@ POST /kv-cache/register-warmth. All I/O is in a background thread.
 
 Env flags:
   - AITHER_NEXUS_KV_ENABLED=1 (default OFF)
-  - AITHER_NEXUS_URL (default https://aitheros-nexus:8122)
+  - AITHER_NEXUS_URL (default https://aither-nexus:8122)
   - AITHER_NODE_ID (default hostname)
   - AITHER_CA_BUNDLE (optional, TLS CA path)
 """
@@ -25,7 +25,7 @@ from typing import Any
 logger = logging.getLogger("aither.kvcache.warmth")
 
 _ENABLED = os.environ.get("AITHER_NEXUS_KV_ENABLED", "0") == "1"
-_NEXUS_URL = os.environ.get("AITHER_NEXUS_URL", "https://aitheros-nexus:8122")
+_NEXUS_URL = os.environ.get("AITHER_NEXUS_URL", "https://aither-nexus:8122")
 _NODE_ID = os.environ.get("AITHER_NODE_ID", "").strip() or socket.gethostname()
 # Platform credential — Nexus /kv-cache/* requires X-Internal-Key (require_nexus_auth).
 # Read lazily at send time so a key rotated into the env after import is picked up.

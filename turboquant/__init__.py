@@ -22,7 +22,29 @@ Usage:
 """
 
 from .quantizer import TurboQuant, TurboQuantConfig
-from .gb10_fp8_rescue import get_gb10_fp8_status, install_gb10_fp8_rescue
+
+# NOT eager, and NOT `.gb10_fp8_rescue` directly. That module has never
+# existed in git, so a direct import raised ModuleNotFoundError at PACKAGE
+# import time and made the whole of lib.gpu.turboquant un-importable — every
+# caller sits behind `try: ... except ImportError`, so this surfaced as the
+# features being switched off rather than as an error (LLMGateway's vLLM-TQ
+# tenant-token SIGNING among them). vllm_patch exposes the same two names as
+# lazy wrappers that import gb10_fp8_rescue when CALLED, which defers the
+# failure to the GB10/sm_121 hardware path where it belongs.
+#
+# vllm_patch itself is imported LAZILY here too — below, as
+# get_gb10_fp8_status()/install_gb10_fp8_rescue(), matching every other
+# hardware-specific entry point in this file (get_block_metadata_table,
+# get_tier_cache_bridge, etc. — all import their dependency inside the
+# function body, none at module level). vllm_patch is the one AitherOS-only
+# file .github/workflows/sync-kvcache.yml deliberately never publishes (see
+# that file's "NOT synced" list), so an EAGER import here broke the published
+# aitherkvcache package's turboquant/__init__.py outright: every
+# `pip install aitherkvcache; import turboquant` raised
+# `ModuleNotFoundError: No module named 'turboquant.vllm_patch'` before a
+# single line of the package's own code ran. Verified 2026-08-18 by staging
+# the real curated payload and importing it as the published top-level
+# `turboquant` package.
 
 __all__ = [
     "TurboQuant",
@@ -74,3 +96,13 @@ def get_strata_cache_shadow():
 def get_graph_eviction_advisor():
     from .graph_eviction_advisor import get_graph_eviction_advisor
     return get_graph_eviction_advisor()
+
+
+def install_gb10_fp8_rescue(force: bool = False) -> bool:
+    from .vllm_patch import install_gb10_fp8_rescue
+    return install_gb10_fp8_rescue(force=force)
+
+
+def get_gb10_fp8_status() -> dict:
+    from .vllm_patch import get_gb10_fp8_status
+    return get_gb10_fp8_status()
