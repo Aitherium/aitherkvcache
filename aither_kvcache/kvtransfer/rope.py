@@ -53,6 +53,21 @@ import numpy as np
 _SUPPORTED_ROPE_TYPES = frozenset({"", "default", "linear", "yarn"})
 
 
+def hf_rope_theta(config: object) -> float:
+    """RoPE base from a transformers config, on both sides of the v5 move.
+
+    transformers 5 dropped ``config.rope_theta`` and keeps it in
+    ``rope_parameters`` (mirrored in ``rope_scaling``). Reading only the v4
+    attribute fell through to 10000 for a 1e6 model — the wrong frequency basis,
+    caught only because load_pack compares it against the pack (KVT004).
+    """
+    for attr in ("rope_parameters", "rope_scaling"):
+        params = getattr(config, attr, None)
+        if isinstance(params, dict) and params.get("rope_theta") is not None:
+            return float(params["rope_theta"])
+    return float(getattr(config, "rope_theta", 10000.0))
+
+
 @dataclass(frozen=True)
 class RopeSpec:
     """Everything needed to reproduce one model's key rotation.
@@ -101,6 +116,7 @@ class RopeSpec:
 
     @classmethod
     def from_hf_config(cls, config: object) -> "RopeSpec":
+        theta = hf_rope_theta(config)
         """Build from a transformers config, refusing anything we cannot reproduce."""
         head_dim = getattr(config, "head_dim", None)
         if not head_dim:
@@ -113,7 +129,7 @@ class RopeSpec:
         if rope_type.lower() == "yarn":
             return cls(
                 head_dim=int(head_dim),
-                theta=float(getattr(config, "rope_theta", 10000.0)),
+                theta=theta,
                 rope_type=rope_type,
                 scaling_factor=factor,
                 beta_fast=float(scaling.get("beta_fast", 32.0)),
@@ -125,7 +141,7 @@ class RopeSpec:
             )
         return cls(
             head_dim=int(head_dim),
-            theta=float(getattr(config, "rope_theta", 10000.0)),
+            theta=theta,
             rope_type=rope_type,
             scaling_factor=factor,
         )

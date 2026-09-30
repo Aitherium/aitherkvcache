@@ -21,7 +21,26 @@ Usage:
     print(tq.memory_report(seq_len=40000, num_layers=32, num_kv_heads=8))
 """
 
-from .quantizer import TurboQuant, TurboQuantConfig
+# TurboQuant / TurboQuantConfig are resolved LAZILY (PEP 562 __getattr__ below).
+# `.quantizer` imports torch at module top (plus .rotation/.packing), so an eager
+# import here made EVERY `from lib.gpu.turboquant.<submodule> import ...` pay for
+# torch + CUDA libs. Measured 2026-09-28 on aitheros-genesis: the /chat/typing-hint
+# prefetch imports `.graph_block_reserver` (which only needs torch once a GPU cache
+# is attached, and imports it inside the method), and that alone put torch in both
+# gunicorn workers, ~0.5 GB RSS each, on a container with no TQGPUCache at all.
+# `from lib.gpu.turboquant import TurboQuant` still works unchanged.
+_LAZY_QUANTIZER_NAMES = ("TurboQuant", "TurboQuantConfig")
+
+
+def __getattr__(name):
+    if name in _LAZY_QUANTIZER_NAMES:
+        from . import quantizer
+
+        value = getattr(quantizer, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # NOT eager, and NOT `.gb10_fp8_rescue` directly. That module has never
 # existed in git, so a direct import raised ModuleNotFoundError at PACKAGE

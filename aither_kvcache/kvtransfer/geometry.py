@@ -38,7 +38,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List
 
-from .rope import RopeSpec
+from .rope import RopeSpec, hf_rope_theta
 
 
 def tokenizer_digest(tokenizer: object) -> str:
@@ -180,7 +180,7 @@ class KVGeometry:
             # true, but it buries the fact that no rope fix could ever make this
             # pair work. Record the geometry, let check_pair state the real one.
             spec = RopeSpec(head_dim=int(head_dim),
-                            theta=float(getattr(config, "rope_theta", 10000.0)))
+                            theta=hf_rope_theta(config))
             scaling = {}
         else:
             spec = RopeSpec.from_hf_config(config)  # validates the schedule, may raise
