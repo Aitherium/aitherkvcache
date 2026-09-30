@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aither-kvcache"
-version = "2.4.0"
+version = "2.4.1"
 description = "KV cache tooling for LLM inference — TurboQuant (vector quantization), TriAttention (spectral compression), and cross-model KV transfer (skip prefill by converting one model's cache into another's)"
 readme = "README.md"
 license = "CC-BY-4.0"
