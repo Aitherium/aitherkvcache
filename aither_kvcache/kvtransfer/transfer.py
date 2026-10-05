@@ -37,6 +37,17 @@ feature is a no-op that reports success — the exact class
 the silent-no-op class: a feature that returns success-shaped output while
 doing nothing, and therefore passes every test that only asserts it did not
 crash.
+
+## Span-aligned packs (different tokenizers)
+
+For a pack whose manifest declares span alignment, the source never sees text
+the target has not read: for a cut at target position ``cut`` the cache carries
+target positions ``0..cut-2``, so the source is run on ``text[:char_end(cut-2)]``
+ONLY — re-tokenized, exactly as a server would see that prefix — and pooled onto
+target rows through the causal CSR. Any CSR entry that would pool a source token
+ending after its target token raises instead of scoring (``causal_violations``).
+``--leak-canary`` deliberately breaks both (full-window text, non-causal
+pooling) to prove the evaluation can see a leak; it may never be recorded.
 """
 
 from __future__ import annotations
@@ -51,6 +62,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .align import (
+    build_span_csr,
+    causal_violations,
+    encode_with_offsets,
+    require_fast_tokenizer,
+)
 from .capture import _extract_kv, _stack_layers, gather_corpus
 from .geometry import KVGeometry
 from .pack import (
@@ -118,6 +135,38 @@ def translate_cache(
     return out
 
 
+def translate_span(
+    source_k_flat: np.ndarray,
+    source_v_flat: np.ndarray,
+    pack: LoadedPack,
+    *,
+    src_offsets: Sequence[Tuple[int, int]],
+    tgt_offsets: Sequence[Tuple[int, int]],
+    positions: Sequence[int] | np.ndarray,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Translate a source cache with its OWN token rows through a span pack.
+
+    ``src_offsets``/``tgt_offsets`` are both tokenizers' character offsets over
+    the SAME text; the source rows are pooled onto target rows by the causal CSR
+    and then mapped exactly as ``translate_cache`` maps positional rows.
+    """
+    spec = pack.alignment
+    if spec is None or spec.method != "span":
+        raise ValueError("translate_span needs a span-aligned pack (manifest alignment)")
+    if not spec.causal:
+        raise ValueError("refusing a non-causal alignment spec at serve time")
+    if source_k_flat.shape[0] != len(src_offsets):
+        raise ValueError(f"{source_k_flat.shape[0]} source rows for "
+                         f"{len(src_offsets)} source offsets")
+    csr = build_span_csr(src_offsets, tgt_offsets, causal=True)
+    leaks = causal_violations(csr, src_offsets, tgt_offsets)
+    if leaks:
+        raise RuntimeError(f"span CSR pools future text into the cache: {leaks[:3]}")
+    k = csr.apply(source_k_flat.astype(np.float32, copy=False))
+    v = csr.apply(source_v_flat.astype(np.float32, copy=False))
+    return translate_cache(k, v, pack, positions)
+
+
 def _to_cache(layers: List[Tuple[np.ndarray, np.ndarray]], torch_mod: Any, device: str,
               dtype: Any) -> Any:
     """Wrap numpy KV in whatever Cache class this transformers ships."""
@@ -160,11 +209,14 @@ def evaluate_acceptance(
     device: str = "cpu",
     dtype: str = "float32",
     skip_docs: int = 0,
+    leak_canary: bool = False,
 ) -> AcceptanceMetrics:
     """Measure what the target model does with a translated cache.
 
     Held-out by construction: ``skip_docs`` moves past the documents used for
-    fitting, so this never scores the mapper on text it was trained on.
+    fitting, so this never scores the mapper on text it was trained on. A
+    span-aligned pack is measured in span mode (module docstring);
+    ``leak_canary`` is span-only and its result must never be recorded.
     """
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -179,16 +231,29 @@ def evaluate_acceptance(
 
     pack = load_pack(pack_dir, live_source=geom_src, live_target=geom_tgt,
                      require_acceptance=False)
+    span = pack.alignment is not None and pack.alignment.method == "span"
+    if leak_canary and not span:
+        raise ValueError("--leak-canary applies to span-aligned packs only")
+    if span:
+        require_fast_tokenizer(tok_src, "source")
+        require_fast_tokenizer(tok, "target")
 
     docs = gather_corpus(corpus_roots, (".md", ".py", ".txt"), skip_docs + n_sequences * 4)
     docs = docs[skip_docs:]
     seqs: List[List[int]] = []
+    seq_docs: List[str] = []
+    seq_offsets: List[List[Tuple[int, int]]] = []
     for doc in docs:
         if len(seqs) >= n_sequences:
             break
-        ids = tok(doc, add_special_tokens=False)["input_ids"]
+        if span:
+            ids, offs = encode_with_offsets(tok, doc)
+        else:
+            ids, offs = tok(doc, add_special_tokens=False)["input_ids"], []
         if len(ids) >= seq_len:
             seqs.append(ids[:seq_len])
+            seq_docs.append(doc)
+            seq_offsets.append(offs[:seq_len])
     if len(seqs) < 2:
         raise RuntimeError(
             f"need at least 2 eval sequences of {seq_len} tokens, got {len(seqs)}"
@@ -197,15 +262,50 @@ def evaluate_acceptance(
     positions = np.arange(seq_len, dtype=np.int64)
     src_model = AutoModelForCausalLM.from_pretrained(
         source_id, dtype=torch_dtype, attn_implementation="eager").to(device).eval()
-    translated: List[List[Tuple[np.ndarray, np.ndarray]]] = []
-    for seq in seqs:
-        ids = torch.tensor([seq], dtype=torch.long, device=device)
+    # Translated caches are built lazily and only the two in use (this sequence and its
+    # control) are kept: ~150 MB each for an 8B target, so pre-building all of them held
+    # ~20 GB at 136 sequences and OOM-killed a CPU run (2026-10-01). The source model
+    # therefore stays loaded beside the target (~1.2 GB for 0.6B): a small fixed cost.
+    translated: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {}
+
+    def full_translation(i: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+        if i not in translated:
+            ids = torch.tensor([seqs[i]], dtype=torch.long, device=device)
+            with torch.no_grad():
+                out = src_model(ids, use_cache=True)
+            k_flat, v_flat = _stack_layers(_extract_kv(out.past_key_values), geom_src,
+                                           positions)
+            translated[i] = translate_cache(k_flat.astype(np.float32),
+                                            v_flat.astype(np.float32), pack, positions)
+        return translated[i]
+
+    span_stats = {"carried": 0, "empty": 0, "canary_leaks": 0}
+
+    def context_cache(i: int, cut: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Translated cache for target positions 0..cut-2 of sequence i."""
+        if not span:
+            return _slice_layers(full_translation(i), cut - 1)
+        n_ctx = cut - 1
+        t_off = seq_offsets[i]
+        end_char = t_off[(seq_len if leak_canary else n_ctx) - 1][1]
+        src_ids, src_offs = encode_with_offsets(tok_src, seq_docs[i][:end_char])
+        if not src_ids:
+            raise RuntimeError(f"source tokenized text[:{end_char}] to nothing")
         with torch.no_grad():
-            out = src_model(ids, use_cache=True)
-        k_flat, v_flat = _stack_layers(_extract_kv(out.past_key_values), geom_src, positions)
-        translated.append(translate_cache(k_flat.astype(np.float32),
-                                          v_flat.astype(np.float32), pack, positions))
-    del src_model
+            out = src_model(torch.tensor([src_ids], dtype=torch.long, device=device),
+                            use_cache=True)
+        k_flat, v_flat = _stack_layers(_extract_kv(out.past_key_values), geom_src,
+                                       np.arange(len(src_ids), dtype=np.int64))
+        csr = build_span_csr(src_offs, t_off[:n_ctx], causal=not leak_canary)
+        leaks = causal_violations(csr, src_offs, t_off[:n_ctx])
+        if leaks and not leak_canary:
+            raise RuntimeError(f"span CSR leaks future text at cut {cut}: {leaks[:3]}")
+        span_stats["canary_leaks"] += len(leaks)
+        span_stats["carried"] += csr.n_carried
+        span_stats["empty"] += csr.n_empty
+        return translate_cache(csr.apply(k_flat.astype(np.float32)),
+                               csr.apply(v_flat.astype(np.float32)), pack,
+                               np.arange(n_ctx, dtype=np.int64))
 
     tgt_model = AutoModelForCausalLM.from_pretrained(
         target_id, dtype=torch_dtype, attn_implementation="eager").to(device).eval()
@@ -222,6 +322,8 @@ def evaluate_acceptance(
         with torch.no_grad():
             ref_logits = tgt_model(ids, use_cache=False).logits[0]
         control_idx = (idx + 1) % len(seqs)
+        for stale in [k for k in translated if k not in (idx, control_idx)]:
+            del translated[stale]
 
         for cut in cuts:
             if cut < 2 or cut >= seq_len:
@@ -237,8 +339,8 @@ def evaluate_acceptance(
 
             last = torch.tensor([[seq[cut - 1]]], dtype=torch.long, device=device)
             arms = {
-                "translated": _slice_layers(translated[idx], cut - 1),
-                "control": _slice_layers(translated[control_idx], cut - 1),
+                "translated": context_cache(idx, cut),
+                "control": context_cache(control_idx, cut),
                 "nocontext": None,
             }
             for arm, layers in arms.items():
@@ -262,7 +364,8 @@ def evaluate_acceptance(
                 tallies[arm]["n"] += 1.0
         logger.info("[eval] sequence %d/%d", idx + 1, len(seqs))
 
-    del tgt_model
+    del tgt_model, src_model
+    translated.clear()
     if n_positions == 0:
         raise RuntimeError("no evaluation positions were scored — check --cuts vs --seq-len")
 
@@ -282,7 +385,11 @@ def evaluate_acceptance(
         nll_control=mean("control", "nll"),
         top1_nocontext=mean("nocontext", "agree"),
         nll_nocontext=mean("nocontext", "nll"),
-        notes=f"cuts={list(cuts)} seq_len={seq_len} skip_docs={skip_docs}",
+        notes=(f"cuts={list(cuts)} seq_len={seq_len} skip_docs={skip_docs}"
+               + (f" align=span digest={pack.alignment.digest()[:16]} "  # type: ignore[union-attr]
+                  f"carried={span_stats['carried']} empty={span_stats['empty']}"
+                  if span else "")
+               + (f" LEAK-CANARY leaks={span_stats['canary_leaks']}" if leak_canary else "")),
     )
 
 
@@ -380,6 +487,42 @@ def _self_test() -> int:
 
         check("slice_layers", _slice_layers(layers, 3)[0][0].shape == (1, 3, 3, 4),
               f"got {_slice_layers(layers, 3)[0][0].shape}")
+
+        # Span packs: identical offsets reproduce translate_cache exactly, and a
+        # positional pack is refused by translate_span.
+        from .align import AlignmentSpec
+
+        span_dir = tmp / "span"
+        src_s = KVGeometry(**{**src.to_dict(), "tokenizer_sha256": "y" * 64})
+        write_pack(span_dir, maps, source=src_s, target=tgt, top_k=2, regime_flags=[],
+                   train_tokens=100, val_tokens=50, corpus_sha256="q" * 64,
+                   created_at=0.0, weight_dtype="float32",
+                   alignment=AlignmentSpec.span("y" * 64, "z" * 64))
+        span_pack = load_pack(span_dir, live_source=src_s, live_target=tgt,
+                              require_acceptance=False)
+        offs = [(i, i + 1) for i in range(n_tok)]
+        via_span = translate_span(k_flat, v_flat, span_pack, src_offsets=offs,
+                                  tgt_offsets=offs, positions=np.arange(n_tok))
+        check("span_identity_matches_positional",
+              all(np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+                  for a, b in zip(via_span, layers)),
+              "identity span translation differs from positional translation")
+        # Two source tokens per target token: target rows are the source means.
+        src_offs2 = [(i, i + 1) for i in range(2 * n_tok)]
+        tgt_offs2 = [(2 * i, 2 * i + 2) for i in range(n_tok)]
+        k2 = np.repeat(k_flat, 2, axis=0)
+        v2 = np.repeat(v_flat, 2, axis=0)
+        via_pool = translate_span(k2, v2, span_pack, src_offsets=src_offs2,
+                                  tgt_offsets=tgt_offs2, positions=np.arange(n_tok))
+        check("span_pooling_means",
+              np.allclose(via_pool[0][1], layers[0][1], atol=1e-5),
+              "mean of two identical source rows did not reproduce the row")
+        try:
+            translate_span(k_flat, v_flat, pack, src_offsets=offs, tgt_offsets=offs,
+                           positions=np.arange(n_tok))
+            check("span_refuses_positional_pack", False, "accepted a positional pack")
+        except ValueError as exc:
+            check("span_refuses_positional_reason", "span-aligned" in str(exc), str(exc))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -403,6 +546,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--dtype", default="float32")
     ap.add_argument("--record", action="store_true",
                     help="write the measurement into the pack manifest")
+    ap.add_argument("--leak-canary", action="store_true",
+                    help="span packs: deliberately leak future text (never recordable)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
 
@@ -411,13 +556,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _self_test()
     if not (args.pack and args.source and args.target):
         ap.error("--pack, --source and --target are required")
+    if args.leak_canary and args.record:
+        ap.error("--leak-canary measures a deliberately leaking cache; never --record it")
 
     t0 = time.time()
     metrics = evaluate_acceptance(
         args.pack, source_id=args.source, target_id=args.target,
         corpus_roots=args.corpus, cuts=args.cuts, seq_len=args.seq_len,
         n_sequences=args.sequences, device=args.device, dtype=args.dtype,
-        skip_docs=args.skip_docs,
+        skip_docs=args.skip_docs, leak_canary=args.leak_canary,
     )
     if args.record:
         record_acceptance(args.pack, metrics)

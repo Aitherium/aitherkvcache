@@ -25,6 +25,12 @@ degraded-looking output. So every one of these is a refusal, never a warning:
   rope) -> the weights are shaped for a different model.
 * **KVT005** tokenizer digest disagreement -> positions do not correspond.
 * **KVT006** weight digest disagreement -> the blob was edited or truncated.
+* **KVT008** alignment disagreement. A span-aligned pack (``align.py``) is only
+  valid for the exact pooling rule and tokenizer pair it was fitted under, so
+  its ``AlignmentSpec`` digest must re-derive from its own fields, name the
+  pack's tokenizers, and equal the alignment the caller will serve with. A
+  positional pack is refused when the caller declares span serving, and when its
+  two sides do not share one tokenizer (row i must be the same token).
 
 ``load_pack`` requires the caller to pass the live source and target geometry.
 There is deliberately no "just load it" path: a pack loaded without anything to
@@ -43,6 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .align import AlignmentSpec
 from .geometry import KVGeometry
 from .mapper import LayerMap
 
@@ -132,9 +139,32 @@ class PackManifest:
     max_nll_delta: float = DEFAULT_MAX_NLL_DELTA
     min_acceptance_positions: int = DEFAULT_MIN_ACCEPTANCE_POSITIONS
     acceptance: Optional[Dict[str, Any]] = None
+    #: ``{"spec": AlignmentSpec.to_dict(), "digest": sha256}`` for a span pack.
+    #: Absent (never null) on a positional pack, so a positional pack written by
+    #: this build stays readable by builds that predate the field.
+    alignment: Optional[Dict[str, Any]] = None
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, sort_keys=True)
+        data = asdict(self)
+        if data.get("alignment") is None:
+            data.pop("alignment", None)
+        return json.dumps(data, indent=2, sort_keys=True)
+
+    def alignment_spec(self) -> Optional[AlignmentSpec]:
+        """The span spec, or None for a positional pack. Raises KVT008 if malformed."""
+        if not self.alignment:
+            return None
+        try:
+            spec = AlignmentSpec.from_dict(dict(self.alignment["spec"]))
+            stored = str(self.alignment["digest"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PackRefusedError(f"KVT008 alignment record malformed: {exc}") from exc
+        if spec.digest() != stored:
+            raise PackRefusedError(
+                f"KVT008 alignment digest {stored[:16]} does not re-derive from its own "
+                f"spec ({spec.digest()[:16]}) — the record was edited"
+            )
+        return spec
 
 
 def _weights_path(pack_dir: Path) -> Path:
@@ -166,8 +196,19 @@ def write_pack(
     corpus_sha256: str,
     created_at: float,
     weight_dtype: str = "float16",
+    alignment: Optional[AlignmentSpec] = None,
 ) -> PackManifest:
-    """Persist fitted maps plus the manifest that makes them loadable."""
+    """Persist fitted maps plus the manifest that makes them loadable.
+
+    ``alignment`` is the span spec the capture used; ``None`` (or a positional
+    spec) writes an ordinary positional pack.
+    """
+    align_record: Optional[Dict[str, Any]] = None
+    if alignment is not None and alignment.method != "positional":
+        if (alignment.source_tokenizer_sha256 != source.tokenizer_sha256
+                or alignment.target_tokenizer_sha256 != target.tokenizer_sha256):
+            raise ValueError("alignment spec names different tokenizers than the geometry")
+        align_record = {"spec": alignment.to_dict(), "digest": alignment.digest()}
     pack_dir.mkdir(parents=True, exist_ok=True)
     arrays: Dict[str, np.ndarray] = {}
     per_layer: Dict[str, Any] = {}
@@ -209,6 +250,7 @@ def write_pack(
         val_tokens=val_tokens,
         corpus_sha256=corpus_sha256,
         created_at=created_at,
+        alignment=align_record,
     )
     _manifest_path(pack_dir).write_text(manifest.to_json(), encoding="utf-8")
     return manifest
@@ -249,6 +291,7 @@ class LoadedPack:
     source: KVGeometry
     target: KVGeometry
     weights: Dict[str, np.ndarray] = field(repr=False, default_factory=dict)
+    alignment: Optional[AlignmentSpec] = None   # None = positional
 
     def layer_map(self, role: str, layer: int) -> Tuple[np.ndarray, np.ndarray, List[int]]:
         try:
@@ -289,8 +332,15 @@ def load_pack(
     max_nll_delta: Optional[float] = None,
     min_acceptance_positions: Optional[int] = None,
     require_acceptance: bool = True,
+    live_alignment: Optional[AlignmentSpec] = None,
 ) -> LoadedPack:
-    """Load a pack, refusing on any rule. Never returns a partially-checked pack."""
+    """Load a pack, refusing on any rule. Never returns a partially-checked pack.
+
+    ``live_alignment`` is how the caller will align source rows at serve time.
+    ``None`` means "what the pack declares, re-derived from the LIVE tokenizers":
+    for a span pack that is ``AlignmentSpec.span(live src, live tgt)``, so the
+    digest is still compared, never skipped.
+    """
     manifest = read_manifest(pack_dir)
 
     if manifest.format_version != PACK_FORMAT_VERSION:
@@ -306,6 +356,8 @@ def load_pack(
         raise PackRefusedError("KVT005 source tokenizer digest differs from the pack's")
     if stored_tgt.tokenizer_sha256 != live_target.tokenizer_sha256:
         raise PackRefusedError("KVT005 target tokenizer digest differs from the pack's")
+    _check_alignment(manifest, stored_src, stored_tgt, live_source, live_target,
+                     live_alignment)
     for conflict in (
         _geometry_conflict(stored_src, live_source, "source"),
         _geometry_conflict(stored_tgt, live_target, "target"),
@@ -375,7 +427,43 @@ def load_pack(
             f"{stored_tgt.n_layers}-layer target"
         )
     return LoadedPack(manifest=manifest, source=stored_src, target=stored_tgt,
-                      weights=weights)
+                      weights=weights, alignment=manifest.alignment_spec())
+
+
+def _check_alignment(
+    manifest: PackManifest,
+    stored_src: KVGeometry,
+    stored_tgt: KVGeometry,
+    live_source: KVGeometry,
+    live_target: KVGeometry,
+    live_alignment: Optional[AlignmentSpec],
+) -> None:
+    """KVT005 cross-side + KVT008. Per-side tokenizer drift is checked before this."""
+    spec = manifest.alignment_spec()
+    if spec is None:
+        if stored_src.tokenizer_sha256 != stored_tgt.tokenizer_sha256:
+            raise PackRefusedError(
+                "KVT005 positional pack whose source and target tokenizers differ — row "
+                "i is not the same token on both sides"
+            )
+        if live_alignment is not None and live_alignment.method != "positional":
+            raise PackRefusedError(
+                f"KVT008 pack is positional, caller serves {live_alignment.method!r} "
+                "alignment"
+            )
+        return
+    if (spec.source_tokenizer_sha256 != stored_src.tokenizer_sha256
+            or spec.target_tokenizer_sha256 != stored_tgt.tokenizer_sha256):
+        raise PackRefusedError(
+            "KVT008 alignment spec names different tokenizers than the pack geometry"
+        )
+    live = live_alignment or AlignmentSpec.span(live_source.tokenizer_sha256,
+                                                live_target.tokenizer_sha256)
+    if live.digest() != spec.digest():
+        raise PackRefusedError(
+            f"KVT008 alignment digest differs: pack={spec.digest()[:16]} "
+            f"live={live.digest()[:16]} (method {spec.method!r} vs {live.method!r})"
+        )
 
 
 # ── self-test ───────────────────────────────────────────────────────────────
@@ -504,6 +592,48 @@ def _self_test() -> int:
               load_pack(tmp, live_source=src, live_target=tgt) is not None,
               "pack did not load after restoring the original bytes — the gate "
               "may be refusing unconditionally")
+
+        # ── KVT008: span-aligned pack ───────────────────────────────────────
+        span_dir = tmp / "span"
+        src_other = geom("small", 3, 2, "s" * 64)       # a DIFFERENT tokenizer
+        spec = AlignmentSpec.span(src_other.tokenizer_sha256, tgt.tokenizer_sha256)
+        write_pack(span_dir, maps, source=src_other, target=tgt, top_k=2,
+                   regime_flags=[], train_tokens=1000, val_tokens=200,
+                   corpus_sha256="e" * 64, created_at=time.time(), alignment=spec)
+        record_acceptance(span_dir, AcceptanceMetrics(
+            top1_agreement=0.91, nll_translated=2.10, nll_reference=2.00,
+            nll_delta=0.10, n_positions=500, eval_sequences=20))
+        got = load_pack(span_dir, live_source=src_other, live_target=tgt)
+        check("span_pack_loads", got.alignment is not None
+              and got.alignment.digest() == spec.digest(), "span pack did not load")
+        check("span_alignment_survives_record",
+              read_manifest(span_dir).alignment is not None,
+              "record_acceptance dropped the alignment record")
+        refuses("span_live_digest", "KVT008",
+                lambda: load_pack(span_dir, live_source=src_other, live_target=tgt,
+                                  live_alignment=AlignmentSpec(
+                                      **{**spec.to_dict(), "causal": False})))
+        refuses("span_tokenizer_drift", "KVT005",
+                lambda: load_pack(span_dir, live_source=geom("small", 3, 2, "q" * 64),
+                                  live_target=tgt))
+        man_path = _manifest_path(span_dir)
+        good_text = man_path.read_text(encoding="utf-8")
+        data = json.loads(good_text)
+        data["alignment"]["spec"]["pooling"] = "max"
+        man_path.write_text(json.dumps(data), encoding="utf-8")
+        refuses("span_record_edited", "KVT008",
+                lambda: load_pack(span_dir, live_source=src_other, live_target=tgt))
+        man_path.write_text(good_text, encoding="utf-8")
+        check("span_mutation_guard",
+              load_pack(span_dir, live_source=src_other, live_target=tgt) is not None,
+              "restored span pack refused — KVT008 may refuse unconditionally")
+        # A positional pack refuses span serving, and is unchanged on disk.
+        refuses("positional_refuses_span_serving", "KVT008",
+                lambda: load_pack(tmp, live_source=src, live_target=tgt,
+                                  live_alignment=AlignmentSpec.span("d" * 64, "d" * 64)))
+        check("positional_has_no_alignment_key",
+              "alignment" not in json.loads(_manifest_path(tmp).read_text(encoding="utf-8")),
+              "a positional manifest grew an alignment key; pre-M3 readers would refuse it")
 
         # Missing manifest -> KVT001.
         _manifest_path(tmp).unlink()

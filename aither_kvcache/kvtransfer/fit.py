@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .align import AlignmentSpec
 from .capture import CaptureManifest
 from .geometry import KVGeometry, check_pair
 from .mapper import GramStats, LayerMap, fit_layer_map
@@ -77,7 +78,11 @@ def fit_pack(
     cap = CaptureManifest.read(cap_dir)
     geom_src = KVGeometry.from_dict(cap.source)
     geom_tgt = KVGeometry.from_dict(cap.target)
-    check_pair(geom_src, geom_tgt).raise_if_blocked()
+    # A span capture already stores source rows pooled onto target positions, so
+    # the fit itself is unchanged; only eligibility and the pack record differ.
+    alignment = _capture_alignment(cap)
+    check_pair(geom_src, geom_tgt,
+               align=alignment.method if alignment else "positional").raise_if_blocked()
 
     src_block = geom_src.per_layer_width
     tgt_block = geom_tgt.per_layer_width
@@ -134,7 +139,7 @@ def fit_pack(
         out_dir, all_maps, source=geom_src, target=geom_tgt, top_k=top_k,
         regime_flags=cap.regime_flags, train_tokens=cap.n_train_tokens,
         val_tokens=cap.n_val_tokens, corpus_sha256=cap.corpus_sha256,
-        created_at=time.time(), weight_dtype=weight_dtype,
+        created_at=time.time(), weight_dtype=weight_dtype, alignment=alignment,
     )
     weight_bytes = (out_dir / "mapper.npz").stat().st_size
     summary["pack"] = {
@@ -146,6 +151,20 @@ def fit_pack(
         "regime_flags": manifest.regime_flags,
     }
     return summary
+
+
+def _capture_alignment(cap: CaptureManifest) -> "AlignmentSpec | None":
+    """The capture's span spec, verified against its own digest; None = positional."""
+    record = cap.alignment
+    if not record:
+        return None
+    spec = AlignmentSpec.from_dict(dict(record["spec"]))
+    if spec.digest() != record.get("digest"):
+        raise ValueError("capture alignment digest does not re-derive from its spec")
+    if (spec.source_tokenizer_sha256 != cap.source.get("tokenizer_sha256")
+            or spec.target_tokenizer_sha256 != cap.target.get("tokenizer_sha256")):
+        raise ValueError("capture alignment names different tokenizers than its geometry")
+    return spec
 
 
 def _self_test() -> int:
@@ -216,6 +235,41 @@ def _self_test() -> int:
               summary["k"]["val_r2_topk"] > single["k"]["val_r2_topk"] + 0.05,
               f"top2={summary['k']['val_r2_topk']:.4f} vs "
               f"top1={single['k']['val_r2_topk']:.4f} — selection adds nothing")
+
+        # A span capture with DIFFERENT tokenizers fits, and the pack records it.
+        span_cap = tmp / "span"
+        span_cap.mkdir()
+        for f in tmp.glob("*.npy"):
+            (span_cap / f.name).write_bytes(f.read_bytes())
+        src_d = geom("src", n_src_layers, src_kv)
+        src_d["tokenizer_sha256"] = "f" * 64
+        spec = AlignmentSpec.span("f" * 64, "a" * 64)
+        CaptureManifest(
+            source=src_d, target=geom("tgt", n_tgt_layers, tgt_kv),
+            seq_len=64, n_train_tokens=n_tr, n_val_tokens=n_va,
+            n_train_docs=10, n_val_docs=3, corpus_sha256="b" * 64,
+            regime_flags=[], created_at=0.0,
+            alignment={"spec": spec.to_dict(), "digest": spec.digest()},
+        ).write(span_cap)
+        fit_pack(span_cap, span_cap / "pack", top_k=2)
+        sman = json.loads((span_cap / "pack" / "mapper.manifest.json")
+                          .read_text(encoding="utf-8"))
+        check("span_pack_records_alignment",
+              (sman.get("alignment") or {}).get("digest") == spec.digest(),
+              f"pack alignment {sman.get('alignment')}")
+        check("positional_pack_has_no_alignment", "alignment" not in man,
+              "positional pack grew an alignment record")
+        # ...and the same different-tokenizer capture WITHOUT a span record refuses.
+        cap_json = span_cap / "capture.manifest.json"
+        raw = json.loads(cap_json.read_text(encoding="utf-8"))
+        raw["alignment"] = None
+        cap_json.write_text(json.dumps(raw), encoding="utf-8")
+        try:
+            fit_pack(span_cap, span_cap / "pack3", top_k=2)
+            check("positional_mismatch_refused", False,
+                  "fitted a different-tokenizer capture with no span alignment")
+        except ValueError as exc:
+            check("positional_mismatch_reason", "tokenizer" in str(exc), str(exc))
 
         try:
             fit_pack(tmp, tmp / "pack2", top_k=99)

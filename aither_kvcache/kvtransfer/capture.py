@@ -21,6 +21,18 @@ exactly. A mismatch raises; it never truncates to the shorter one, because a
 silently truncated pair produces a perfectly well-formed capture of misaligned
 rows, which is the single failure mode that no downstream number can reveal.
 
+## ``--align span``: different tokenizers
+
+With ``align="span"`` each document is tokenized by BOTH tokenizers with
+character offsets (fast tokenizers only). The TARGET token stream is cut into
+``seq_len`` windows; each window's source tokens are the ones that cover the
+same characters (``align.source_window``), so both models read the same text.
+Each model runs on its OWN ids; the source's de-rotated KV is then pooled onto
+the target's rows through the causal CSR (``align.build_span_csr``) and stored
+with exactly the positional layout, so ``fit.py`` reads it unchanged. Per-side
+ids, offsets, CSRs and the document index are kept in ``{split}_align.npz`` so a
+row can always be traced back to the characters it came from.
+
 ## Splits are by DOCUMENT
 
 Not by token (adjacent tokens are near-duplicates) and not even by sequence
@@ -43,6 +55,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .align import (
+    AlignmentSpec,
+    SpanCSR,
+    build_span_csr,
+    encode_with_offsets,
+    fractional_spans,
+    require_fast_tokenizer,
+    source_window,
+)
 from .geometry import KVGeometry, check_pair
 from .rope import strip_rope
 
@@ -64,6 +85,10 @@ class CaptureManifest:
     regime_flags: List[str]
     created_at: float
     dtype: str = "float16"
+    #: ``{"spec": AlignmentSpec.to_dict(), "digest": ...}``; None = positional.
+    alignment: Optional[Dict[str, Any]] = None
+    #: Span-mode counters (carried / empty target rows, unused source tokens).
+    align_stats: Optional[Dict[str, Any]] = None
 
     def write(self, out_dir: Path) -> None:
         (out_dir / "capture.manifest.json").write_text(
@@ -307,6 +332,104 @@ def _chunk(ids: List[int], seq_len: int) -> List[List[int]]:
     return [ids[i * seq_len:(i + 1) * seq_len] for i in range(n)]
 
 
+@dataclass
+class SpanWindow:
+    """One span-aligned training window: both sides' ids over the same text."""
+
+    doc_index: int
+    tgt_ids: List[int]
+    tgt_offsets: List[Tuple[int, int]]
+    src_ids: List[int]
+    src_offsets: List[Tuple[int, int]]
+    csr: SpanCSR
+
+
+def build_span_windows(
+    docs: Sequence[str],
+    want: int,
+    tok_src: Any,
+    tok_tgt: Any,
+    seq_len: int,
+    *,
+    doc_base: int = 0,
+) -> Tuple[List[SpanWindow], Dict[str, int]]:
+    """Cut documents into ``seq_len``-target-token windows, cut by characters.
+
+    A document whose offsets are not ordered spans is SKIPPED and counted —
+    never guessed at, because a wrong span assignment is a silent row
+    misalignment, the one failure no downstream number reveals.
+    """
+    windows: List[SpanWindow] = []
+    stats = {"docs_skipped_bad_offsets": 0, "windows_skipped_empty_source": 0,
+             "n_carried": 0, "n_empty": 0, "n_unused_src": 0, "src_tokens": 0}
+    for d, doc in enumerate(docs):
+        if len(windows) >= want:
+            break
+        ids_t, off_t = encode_with_offsets(tok_tgt, doc)
+        ids_s, off_s = encode_with_offsets(tok_src, doc)
+        try:
+            spans_t = fractional_spans(off_t)
+            spans_s = fractional_spans(off_s)
+        except ValueError:
+            stats["docs_skipped_bad_offsets"] += 1
+            continue
+        for w in range(len(ids_t) // seq_len):
+            if len(windows) >= want:
+                break
+            t_lo, t_hi = w * seq_len, (w + 1) * seq_len
+            s_lo, s_hi = source_window(spans_s, spans_t, t_lo, t_hi)
+            if s_hi <= s_lo:
+                stats["windows_skipped_empty_source"] += 1
+                continue
+            csr = build_span_csr(off_s[s_lo:s_hi], off_t[t_lo:t_hi])
+            for key in ("n_carried", "n_empty", "n_unused_src"):
+                stats[key] += int(getattr(csr, key))
+            stats["src_tokens"] += s_hi - s_lo
+            windows.append(SpanWindow(
+                doc_index=doc_base + d, tgt_ids=ids_t[t_lo:t_hi],
+                tgt_offsets=off_t[t_lo:t_hi], src_ids=ids_s[s_lo:s_hi],
+                src_offsets=off_s[s_lo:s_hi], csr=csr))
+    return windows, stats
+
+
+def save_span_store(path: Path, windows: Sequence[SpanWindow]) -> None:
+    """Persist both sides' ids, offsets and the CSRs, flat with index pointers."""
+    src_ptr = np.cumsum([0] + [len(w.src_ids) for w in windows]).astype(np.int64)
+    nnz_ptr = np.cumsum([0] + [w.csr.indices.size for w in windows]).astype(np.int64)
+
+    def cat(parts: List[np.ndarray], dtype: Any, width: int = 0) -> np.ndarray:
+        if parts:
+            return np.concatenate(parts).astype(dtype)
+        return np.zeros((0, width) if width else (0,), dtype=dtype)
+
+    np.savez(
+        path,
+        doc_index=np.asarray([w.doc_index for w in windows], dtype=np.int64),
+        tgt_ids=np.asarray([w.tgt_ids for w in windows], dtype=np.int64),
+        tgt_offsets=np.asarray([w.tgt_offsets for w in windows], dtype=np.int64),
+        src_ptr=src_ptr,
+        src_ids=cat([np.asarray(w.src_ids) for w in windows], np.int64),
+        src_offsets=cat([np.asarray(w.src_offsets).reshape(-1, 2) for w in windows],
+                        np.int64, 2),
+        csr_nnz_ptr=nnz_ptr,
+        csr_indptr=np.asarray([w.csr.indptr for w in windows], dtype=np.int64),
+        csr_indices=cat([w.csr.indices for w in windows], np.int64),
+        csr_data=cat([w.csr.data for w in windows], np.float32),
+    )
+
+
+def _pool_rows(blocks: Dict[str, np.ndarray], batch: Sequence[SpanWindow], max_len: int
+               ) -> Dict[str, np.ndarray]:
+    """(b*max_len, W) per role -> (b*seq_len, W): each item pooled by its own CSR."""
+    out: Dict[str, np.ndarray] = {}
+    for role, arr in blocks.items():
+        per_item = arr.reshape(len(batch), max_len, -1)
+        out[role] = np.concatenate([
+            win.csr.apply(per_item[i, :len(win.src_ids)]) for i, win in enumerate(batch)
+        ], axis=0)
+    return out
+
+
 def capture_pair(
     source_id: str,
     target_id: str,
@@ -320,8 +443,12 @@ def capture_pair(
     device: str = "cpu",
     dtype: str = "float32",
     max_docs: int = 400,
+    align: str = "positional",
 ) -> CaptureManifest:
-    """Run both models over one aligned corpus and persist their KV."""
+    """Run both models over one aligned corpus and persist their KV.
+
+    ``align="span"`` admits different tokenizers (module docstring).
+    """
     import torch  # local: this module is importable without torch for the gate
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -335,8 +462,13 @@ def capture_pair(
     geom_src = KVGeometry.from_hf(source_id, cfg_src, tok_src, dtype)
     geom_tgt = KVGeometry.from_hf(target_id, cfg_tgt, tok_tgt, dtype)
 
-    verdict = check_pair(geom_src, geom_tgt)
+    verdict = check_pair(geom_src, geom_tgt, align=align)
     verdict.raise_if_blocked()
+    spec: Optional[AlignmentSpec] = None
+    if align == "span":
+        require_fast_tokenizer(tok_src, "source")
+        require_fast_tokenizer(tok_tgt, "target")
+        spec = AlignmentSpec.span(geom_src.tokenizer_sha256, geom_tgt.tokenizer_sha256)
     for flag in verdict.regime_flags:
         logger.warning("[regime] %s", flag)
 
@@ -364,8 +496,21 @@ def capture_pair(
             seqs.extend(_chunk(ids_src, seq_len))
         return seqs[:want]
 
-    train_ids = build(train_docs, train_seqs)
-    val_ids = build(val_docs, val_seqs)
+    span_windows: Dict[str, List[SpanWindow]] = {}
+    align_stats: Optional[Dict[str, Any]] = None
+    if spec is None:
+        train_ids = build(train_docs, train_seqs)
+        val_ids = build(val_docs, val_seqs)
+    else:
+        align_stats = {}
+        for split, doc_list, want, base in (
+            ("train", train_docs, train_seqs, n_val_docs), ("val", val_docs, val_seqs, 0),
+        ):
+            span_windows[split], align_stats[split] = build_span_windows(
+                doc_list, want, tok_src, tok_tgt, seq_len, doc_base=base)
+            logger.info("[align/%s] %s", split, align_stats[split])
+        train_ids = [w.tgt_ids for w in span_windows["train"]]
+        val_ids = [w.tgt_ids for w in span_windows["val"]]
     if len(train_ids) < train_seqs or len(val_ids) < val_seqs:
         raise RuntimeError(
             f"corpus too small: got {len(train_ids)}/{train_seqs} train and "
@@ -375,6 +520,12 @@ def capture_pair(
     corpus_hash = hashlib.sha256()
     for seq in train_ids + val_ids:
         corpus_hash.update(np.asarray(seq, dtype=np.int32).tobytes())
+    if spec is not None:
+        corpus_hash.update(spec.digest().encode("ascii"))
+        for split in ("train", "val"):
+            for win in span_windows[split]:
+                corpus_hash.update(np.asarray(win.src_ids, dtype=np.int32).tobytes())
+            save_span_store(out_dir / f"{split}_align.npz", span_windows[split])
 
     positions = np.arange(seq_len, dtype=np.int64)
     # Role-driven rather than a hardcoded k/v pair: a latent model's cache is
@@ -405,9 +556,23 @@ def capture_pair(
             # per-head K/V before caching); it is hooked at the compression
             # projection. See LatentCapturer.
             capturer = LatentCapturer(model, geom) if geom.is_latent else None
+            # Span mode: the SOURCE runs on its own (variable-length) ids, right
+            # padded — causal attention means padding after a token cannot change
+            # it — and is pooled onto the target's rows before storing.
+            span_src = spec is not None and which == "src"
+            wins = span_windows.get(split, [])
             cursor = 0
             for start in range(0, len(seqs), batch_size):
                 batch = seqs[start:start + batch_size]
+                pos = positions
+                if span_src:
+                    win_batch = wins[start:start + batch_size]
+                    max_len = max(len(w.src_ids) for w in win_batch)
+                    pad = int(getattr(tok_src, "pad_token_id", None)
+                              or getattr(tok_src, "eos_token_id", None) or 0)
+                    batch = [w.src_ids + [pad] * (max_len - len(w.src_ids))
+                             for w in win_batch]
+                    pos = np.arange(max_len, dtype=np.int64)
                 ids = torch.tensor(batch, dtype=torch.long, device=device)
                 if capturer is not None:
                     capturer.reset()
@@ -417,8 +582,10 @@ def capture_pair(
                     blocks = capturer.collect()
                 else:
                     k_flat, v_flat = _stack_layers(_extract_kv(out.past_key_values),
-                                                   geom, positions)
+                                                   geom, pos)
                     blocks = {"k": k_flat, "v": v_flat}
+                if span_src:
+                    blocks = _pool_rows(blocks, win_batch, int(pos.shape[0]))
                 rows = next(iter(blocks.values())).shape[0]
                 for role, arr in blocks.items():
                     stores[(which, role)][cursor:cursor + rows] = arr
@@ -445,6 +612,9 @@ def capture_pair(
         corpus_sha256=corpus_hash.hexdigest(),
         regime_flags=verdict.regime_flags,
         created_at=time.time(),
+        alignment=({"spec": spec.to_dict(), "digest": spec.digest()}
+                   if spec is not None else None),
+        align_stats=align_stats,
     )
     manifest.write(out_dir)
     return manifest
@@ -521,6 +691,38 @@ def _self_test() -> int:
 
     check("chunking", _chunk(list(range(10)), 4) == [[0, 1, 2, 3], [4, 5, 6, 7]],
           "chunker kept a short trailing window")
+
+    # ── span windows over two synthetic tokenizers ─────────────────────────
+    class _CharTok:
+        """Fast-tokenizer stand-in: fixed-width character chunks."""
+
+        is_fast = True
+
+        def __init__(self, width: int) -> None:
+            self.width = width
+
+        def __call__(self, text: str, **_k: Any) -> Dict[str, Any]:
+            offs = [(i, min(len(text), i + self.width))
+                    for i in range(0, len(text), self.width)]
+            return {"input_ids": [ord(text[a]) for a, _ in offs], "offset_mapping": offs}
+
+    text = "abcdefghijklmnopqrstuvwxyz" * 4
+    same, _ = build_span_windows([text], 10, _CharTok(2), _CharTok(2), 8)
+    check("span_same_tok_identity",
+          bool(same) and all(w.csr.is_identity() and w.src_ids == w.tgt_ids for w in same),
+          "same tokenizer did not give identity windows")
+    diff, dstats = build_span_windows([text], 10, _CharTok(3), _CharTok(2), 8)
+    ok_cut = True
+    for w in diff:
+        c0, c1 = w.tgt_offsets[0][0], w.tgt_offsets[-1][1]
+        if w.src_offsets[-1][1] > c1 or w.src_offsets[0][1] <= c0:
+            ok_cut = False
+    check("span_windows_cut_by_chars", bool(diff) and ok_cut,
+          "a source window reaches past its target window's last character")
+    check("span_stats_counted", dstats["src_tokens"] > 0, f"{dstats}")
+    m = max(len(w.src_ids) for w in diff[:2])
+    pooled = _pool_rows({"k": np.ones((2 * m, 3), dtype=np.float16)}, diff[:2], m)
+    check("span_pool_rows", pooled["k"].shape == (16, 3), f"got {pooled['k'].shape}")
 
     # ── latent (MLA) capture ────────────────────────────────────────────────
     # Exercised against a synthetic module tree with DeepSeek's names, because
@@ -623,6 +825,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="float32")
+    ap.add_argument("--align", choices=["positional", "span"], default="positional",
+                    help="span = character-span alignment (different tokenizers)")
+    ap.add_argument("--max-docs", type=int, default=400)
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
 
@@ -635,11 +840,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.source, args.target, args.out, corpus_roots=args.corpus,
         seq_len=args.seq_len, train_seqs=args.train_seqs, val_seqs=args.val_seqs,
         batch_size=args.batch_size, device=args.device, dtype=args.dtype,
+        max_docs=args.max_docs, align=args.align,
     )
     print(json.dumps({
         "train_tokens": manifest.n_train_tokens,
         "val_tokens": manifest.n_val_tokens,
         "regime_flags": manifest.regime_flags,
+        "alignment": manifest.alignment,
+        "align_stats": manifest.align_stats,
     }, indent=2))
     return 0
 

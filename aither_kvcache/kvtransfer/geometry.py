@@ -277,21 +277,42 @@ class PairVerdict:
             )
 
 
-def check_pair(source: KVGeometry, target: KVGeometry) -> PairVerdict:
-    """Definitional refusals, plus regime flags for anything merely unproven."""
+ALIGN_MODES = ("positional", "span")
+
+
+def check_pair(source: KVGeometry, target: KVGeometry, *,
+               align: str = "positional") -> PairVerdict:
+    """Definitional refusals, plus regime flags for anything merely unproven.
+
+    ``align="span"`` (``align.py``) maps target rows from the source tokens that
+    cover the same CHARACTERS, so different tokenizers become fittable and are
+    flagged ``span-aligned`` instead of refused. The positional mode still
+    refuses them: there, row i must be the same token on both sides.
+    """
+    if align not in ALIGN_MODES:
+        raise ValueError(f"align={align!r} not in {ALIGN_MODES}")
     blocking: List[str] = []
     todo: List[str] = []
     flags: List[str] = []
 
-    if source.tokenizer_sha256 != target.tokenizer_sha256:
+    same_tok = source.tokenizer_sha256 == target.tokenizer_sha256
+    if align == "span":
+        flags.append(
+            "span-aligned: target rows pool the source tokens covering the same "
+            "characters (causal CSR); "
+            + ("tokenizers match, so the CSR is the identity" if same_tok else
+               f"tokenizers differ ({source.tokenizer_sha256[:8]} vs "
+               f"{target.tokenizer_sha256[:8]})")
+        )
+    elif not same_tok:
         todo.append(
             f"cross-tokenizer realignment ({source.model_id} {source.tokenizer_sha256[:8]} "
             f"vs {target.model_id} {target.tokenizer_sha256[:8]}). The per-position map "
             "is INVALID as specified — row i is not the same token on both sides. It is "
             "not impossible: both tokenizers decode to the same string, so a "
             "character-span alignment defines which source tokens cover each target "
-            "token, and the map becomes span-pooled rather than positional. That is a "
-            "real research extension, not a config change."
+            "token, and the map becomes span-pooled rather than positional — "
+            "capture with --align span."
         )
     if source.model_id == target.model_id:
         blocking.append("source and target are the same model — nothing to transfer")
@@ -388,6 +409,23 @@ def _self_test() -> int:
     v3 = check_pair(src, _geom(model_id="big"))
     check("mutation_guard_tokenizer", v3.ok,
           f"an otherwise-identical pair was still refused: {v3.blocking}")
+
+    # Span alignment: different tokenizers become ELIGIBLE (flagged), MLA does not.
+    other_tok = _geom(model_id="big", tokenizer_sha256="b" * 64)
+    v_span = check_pair(src, other_tok, align="span")
+    check("span_admits_tokenizer_mismatch", v_span.ok,
+          f"span mode still refused: {v_span.unimplemented}")
+    check("span_flagged", any(f.startswith("span-aligned") for f in v_span.regime_flags),
+          f"no span-aligned flag: {v_span.regime_flags}")
+    check("span_still_refuses_mla", not check_pair(src, mla, align="span").ok,
+          "span mode admitted an MLA target (that is M4)")
+    check("positional_still_refuses_tokenizer", not check_pair(src, other_tok).ok,
+          "positional mode admitted a tokenizer mismatch")
+    try:
+        check_pair(src, other_tok, align="nearest")
+        check("align_mode_closed", False, "accepted an unknown align mode")
+    except ValueError as exc:
+        check("align_mode_reason", "align=" in str(exc), str(exc))
 
     v4 = check_pair(src, src)
     check("self_pair_blocks", not v4.ok, "accepted source == target")
