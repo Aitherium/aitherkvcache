@@ -1,0 +1,29 @@
+# aitherkvcache
+
+> Near-optimal KV cache quantization for LLM inference — sub-byte compression.
+
+KV cache, not weights, is what runs a GPU out of room during real serving, and it grows with every token of every concurrent request.
+
+## Install
+
+```
+pip install aither-kvcache
+```
+
+## Use it in 30 seconds
+
+Quantize the cache on one model you already serve and measure the headroom.
+
+## Composes with
+
+- [awnode](https://aitherium.github.io/awnode/) — A lightweight local gateway — bridges your apps to the AI backends you chose.
+
+## Where it lives
+
+- Repo: https://github.com/Aitherium/aitherkvcache
+- Docs: https://aitherium.github.io/aitherkvcache/
+- Manifest (keys + the one-line adoption story): https://aitherium.github.io/aitherkvcache/aither-manifest.json
+
+This repository is mirrored from the AitherOS monorepo by `.github/workflows/sync-kvcache.yml`; hand edits made here are overwritten on the next sync — change the source instead.
+
+Everything Aitherium, in one file for agents: https://aitherium.com/llms.txt
