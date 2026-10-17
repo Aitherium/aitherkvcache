@@ -1,0 +1,184 @@
+# mirror-hf-set — mirror a WHOLE Hugging Face repo into this repo's release,
+# cloud-to-cloud (awrtifact ≥ 0.2). Repo-agnostic on purpose: every reference
+# is $GITHUB_REPOSITORY, so `awrtifact provision-repo` can seed this file into
+# ANY repo and `awrtifact mirror hf://org/name --repo OWNER/NAME` just works.
+#
+# SOURCE OF TRUTH: AitherOS/packages/awrtifact/awrtifact/data/workflows/ (the
+# copy the CLI seeds). The monorepo mirror under .DEPLOYMENT/workers/ is a
+# regenerable surface — check_awrtifact_lane.py AW009 pins the two copies.
+#
+# Protocol: the CLI enumerates the Hub repo, writes <set>.mirrorset.json into
+# the release FIRST, then dispatches this with the manifest's asset name. The
+# plan job re-reads that manifest from the release (never from an input — a
+# 64 KB inputs cap would truncate a dataset listing silently), computes what
+# is missing at the exact size, and packs the work into <= max_lanes runners
+# (GitHub caps a matrix at 256 jobs; a dataset has more files than that).
+# Each lane Range-fetches its items straight from the Hub and uploads them;
+# the verify job re-lists the release and fails on any missing/short asset,
+# so a green run means the release holds every byte the manifest names.
+#
+# Private/gated repos: set the HF_TOKEN repository secret.
+name: Mirror HF repo set to release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release tag holding <set>.mirrorset.json"
+        required: true
+      manifest:
+        description: "Asset name of the mirror set manifest (<set>.mirrorset.json)"
+        required: true
+      max_lanes:
+        description: "Max parallel runners (matrix cap is 256; bytes-balanced)"
+        required: false
+        default: "20"
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      missing: ${{ steps.plan.outputs.missing }}
+    steps:
+      - name: Read the mirror set from the release and plan missing items
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          MANIFEST: ${{ inputs.manifest }}
+          MAX_LANES: ${{ inputs.max_lanes }}
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -p "$MANIFEST" -O set.json
+          gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "\(.name)\t\(.size)"' > present.tsv || true
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          data = json.load(open("set.json"))
+          present = {}
+          for line in open("present.tsv"):
+              if "\t" in line:
+                  n, s = line.rstrip("\n").split("\t", 1)
+                  present[n] = int(s)
+          items = []
+          for f in data["files"]:
+              if f["parts"]:
+                  off = 0
+                  for i, p in enumerate(f["parts"]):
+                      if present.get(p["name"]) != p["size"]:
+                          items.append({"path": f["path"], "asset": p["name"],
+                                        "offset": off, "size": p["size"], "sha256": None})
+                      off += p["size"]
+              elif f["size"] > 0:
+                  if present.get(f["asset"]) != f["size"]:
+                      items.append({"path": f["path"], "asset": f["asset"],
+                                    "offset": 0, "size": f["size"], "sha256": f.get("sha256")})
+          max_lanes = max(1, int(os.environ.get("MAX_LANES") or "20"))
+          n = min(max_lanes, len(items)) or 0
+          lanes = [[] for _ in range(n)]
+          loads = [0] * n
+          for it in sorted(items, key=lambda x: -x["size"]):
+              i = loads.index(min(loads))
+              lanes[i].append(it)
+              loads[i] += max(1, it["size"])
+          include = [{"lane": i, "items": json.dumps(lane)} for i, lane in enumerate(lanes) if lane]
+          print("matrix=" + json.dumps({"include": include}))
+          print("missing=" + str(len(items)))
+          print(f"planned {len(items)} items across {len(include)} lanes", file=__import__('sys').stderr)
+          EOF
+
+  mirror:
+    needs: plan
+    if: needs.plan.outputs.missing != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+      max-parallel: 20
+      fail-fast: false
+    steps:
+      - name: Fetch lane ${{ matrix.lane }} from the Hub and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          RELEASE: ${{ inputs.release }}
+          MANIFEST: ${{ inputs.manifest }}
+          ITEMS: ${{ matrix.items }}
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -p "$MANIFEST" -O set.json
+          python3 - <<'EOF' > lane.tsv
+          import json, os, urllib.parse
+          data = json.load(open("set.json"))
+          src = data["source"]
+          prefix = {"model": "", "dataset": "datasets/", "space": "spaces/"}[src["kind"]]
+          rev = urllib.parse.quote(src["commit"], safe="")
+          for it in json.loads(os.environ["ITEMS"]):
+              url = f"https://huggingface.co/{prefix}{src['repo_id']}/resolve/{rev}/{urllib.parse.quote(it['path'])}"
+              print("\t".join([it["asset"], url, str(it["offset"]), str(it["size"]), it.get("sha256") or "-"]))
+          EOF
+          AUTH=()
+          if [ -n "${HF_TOKEN:-}" ]; then AUTH=(-H "Authorization: Bearer $HF_TOKEN"); fi
+          while IFS=$'\t' read -r ASSET URL OFFSET SIZE SHA; do
+            END=$((OFFSET + SIZE - 1))
+            # --max-time bounds a STALLED transfer (a hung connection exits 28 and
+            # retries) — without it one stalled fetch hung a runner for 3h+ while
+            # every cheap signal said in_progress (measured 2026-08-09, part7).
+            ok=0
+            for attempt in 1 2 3; do
+              if [ "$SIZE" = "0" ]; then : > "$ASSET"; ok=1; break; fi
+              if curl -sL --fail --connect-timeout 30 --max-time 1800 "${AUTH[@]}" \
+                   -H "Range: bytes=${OFFSET}-${END}" -o "$ASSET" "$URL"; then ok=1; break; fi
+              echo "fetch attempt $attempt failed for $ASSET; retrying"; sleep 5
+            done
+            [ "$ok" = "1" ] || { echo "FETCH FAILED: $ASSET"; exit 1; }
+            got=$(stat -c%s "$ASSET")
+            if [ "$got" != "$SIZE" ]; then echo "SIZE MISMATCH $ASSET: got=$got want=$SIZE"; exit 1; fi
+            if [ "$SHA" != "-" ]; then
+              have=$(sha256sum "$ASSET" | cut -d' ' -f1)
+              if [ "$have" != "$SHA" ]; then echo "SHA256 MISMATCH $ASSET: got=$have want=$SHA"; exit 1; fi
+            fi
+            gh release upload "$RELEASE" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+            rm -f "$ASSET"
+            echo "uploaded $ASSET ($SIZE bytes)"
+          done < lane.tsv
+
+  verify:
+    needs: [plan, mirror]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert the release carries every asset at the manifest size
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" -p "$MANIFEST" -O set.json
+          gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "\(.name)\t\(.size)"' > present.tsv || true
+          python3 - <<'EOF'
+          import json, sys
+          data = json.load(open("set.json"))
+          present = {}
+          for line in open("present.tsv"):
+              if "\t" in line:
+                  n, s = line.rstrip("\n").split("\t", 1)
+                  present[n] = int(s)
+          want = {}
+          for f in data["files"]:
+              if f["parts"]:
+                  for p in f["parts"]:
+                      want[p["name"]] = p["size"]
+              elif f["size"] > 0:
+                  want[f["asset"]] = f["size"]
+          bad = [(n, present.get(n), s) for n, s in want.items() if present.get(n) != s]
+          for n, got, s in bad:
+              print(f"MISSING/SHORT {n}: have={got} want={s}")
+          print(f"{len(want) - len(bad)}/{len(want)} assets verified")
+          sys.exit(1 if bad else 0)
+          EOF
