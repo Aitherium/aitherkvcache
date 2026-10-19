@@ -3,9 +3,9 @@
 # is $GITHUB_REPOSITORY, so `awrtifact provision-repo` can seed this file into
 # ANY repo and `awrtifact mirror hf://org/name --repo OWNER/NAME` just works.
 #
-# SOURCE OF TRUTH: AitherOS/packages/awrtifact/awrtifact/data/workflows/ (the
-# copy the CLI seeds). The monorepo mirror under .DEPLOYMENT/workers/ is a
-# regenerable surface — check_awrtifact_lane.py AW009 pins the two copies.
+# SOURCE OF TRUTH: the awrtifact package (awrtifact/data/workflows/, the copy
+# the CLI seeds). This file is SEEDED into other repos, so it names nothing
+# outside itself: edit the package copy, then re-run `awrtifact provision-repo`.
 #
 # Protocol: the CLI enumerates the Hub repo, writes <set>.mirrorset.json into
 # the release FIRST, then dispatches this with the manifest's asset name. The
