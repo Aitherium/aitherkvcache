@@ -56,4 +56,11 @@ __all__ = [
     # TriAttention — lazy-loaded via subpackage
     # from aither_kvcache.triattention import TriAttention, TriAttentionConfig
 ]
-__version__ = "2.1.0"
+try:
+    # The installed distribution's version, so this can never again disagree with
+    # pyproject.toml (2.4.1 shipped reporting "2.1.0").
+    from importlib.metadata import PackageNotFoundError, version as _dist_version
+
+    __version__ = _dist_version("aither-kvcache")
+except PackageNotFoundError:  # running from a source checkout, not installed
+    __version__ = "0+unknown"
