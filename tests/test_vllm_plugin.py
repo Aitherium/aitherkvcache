@@ -44,8 +44,16 @@ class TestPackageImports:
         assert TurboQuantConfig is TQC2
 
     def test_version_matches_pyproject(self):
+        import re
+        from pathlib import Path
+
         import aither_kvcache
-        assert aither_kvcache.__version__ == "2.1.0"
+        pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8")
+        want = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
+        if aither_kvcache.__version__ == "0+unknown":
+            return  # source checkout, not installed: nothing to compare
+        assert aither_kvcache.__version__ == want
 
     def test_correction_factors_available(self):
         """TurboQuant instances should have correction_factors tensor."""
